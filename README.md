@@ -32,7 +32,7 @@ k6 (local machine)
 │  └─ foundry-swedencentral (weight: configurable)    │
 │                                                     │
 │  Per-backend circuit breakers (azapi)               │
-│  └─ trip on N × {429 | 5xx} within 60s window      │
+│  └─ trip on N × {429 | 5xx} within 60s window       │
 │                                                     │
 │  Backend retry policy (optional)                    │
 │  └─ retry on 429 up to N times against pool         │
