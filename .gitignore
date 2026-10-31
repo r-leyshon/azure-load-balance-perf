@@ -1,0 +1,22 @@
+# Terraform secrets and state
+*.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+tfplan
+# Commit the lock file for reproducible provider versions
+# .terraform.lock.hcl
+
+# Endpoints, keys, and runtime secrets
+infra/.env
+experiment/.env
+.env
+
+# k6 results
+experiment/results/
+*.k6.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/

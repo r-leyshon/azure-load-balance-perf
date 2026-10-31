@@ -1,0 +1,255 @@
+direct_runs:
+  - id: direct_sequential
+    description: "Direct Foundry (no APIM) — sequential fallback UK South → West Europe → Sweden Central. Baseline for APIM overhead measurement."
+    script: experiment/direct_test.js
+    mode: sequential
+    vus: 20
+    iterations: 200
+
+  - id: direct_weighted
+    description: "Direct Foundry (no APIM) — weighted random selection 60/25/15 across regions. No fallback on failure."
+    script: experiment/direct_test.js
+    mode: weighted
+    vus: 20
+    iterations: 200
+
+runs:
+
+  # ---------------------------------------------------------------------------
+  # Phase 1 — baseline characterisation
+  # ---------------------------------------------------------------------------
+
+  - id: baseline
+    description: "Equal weight (33/33/34) across all three regions — no circuit breaker. Foundry backend quotas saturate first."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+
+  - id: weighted_primary
+    description: "UK South favoured (60/25/15) — simulates production PTU priority with pay-as-you-go fallback."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 60, westeurope: 25, swedencentral: 15 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+
+  - id: circuit_breaker
+    description: "Equal weight + circuit breaker trips after 3 failures per backend within 60 s."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+
+  - id: gateway_throttle
+    description: "Low gateway RPM limit (10 req/min) — APIM throttles callers before backends ever saturate."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10
+    circuit_breaker_failure_count: 0
+
+  - id: full_resilience
+    description: "Weighted priority + circuit breaker + moderate gateway limit. Closest to a production configuration."
+    vus: 30
+    iterations: 300
+    weights: { uksouth: 50, westeurope: 30, swedencentral: 20 }
+    gateway_rpm_limit: 500
+    circuit_breaker_failure_count: 3
+
+  - id: asymmetric_cb
+    description: "90% weight on UK South forces fast regional saturation. Circuit breaker (trip on 429+5xx) detects UK South exhaustion and routes remaining traffic to WE and SC with fresh quota."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+
+  - id: cb_5xx_only
+    description: "Equal weights, circuit breaker trips only on 5xx — 429 quota responses are NOT treated as a failure signal."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: false
+
+  # ---------------------------------------------------------------------------
+  # Phase 2a — client-side retry strategies
+  # Base config: equal weights, no circuit breaker, no APIM retry.
+  # The only variable is the k6 retry strategy on 429 responses.
+  # Success metric: eventual_successes / iterations (not http_req_failed).
+  # ---------------------------------------------------------------------------
+
+  - id: retry_immediate
+    description: "Equal weights, no CB. Client retries 429 up to 3× with zero delay — tests naive retry / thundering-herd effect."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: immediate
+    max_retries: 3
+    retry_delay_ms: 500
+
+  - id: retry_fixed_1s
+    description: "Equal weights, no CB. Client retries 429 up to 3× with a fixed 1 s delay."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: fixed
+    max_retries: 3
+    retry_delay_ms: 1000
+
+  - id: retry_backoff
+    description: "Equal weights, no CB. Client retries 429 with exponential backoff (500 ms, 1 s, 2 s)."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: backoff
+    max_retries: 3
+    retry_delay_ms: 500
+
+  - id: retry_backoff_jitter
+    description: "Equal weights, no CB. Client retries 429 with exponential backoff + ±50% uniform jitter — prevents thundering herd."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: backoff_jitter
+    max_retries: 3
+    retry_delay_ms: 500
+
+  - id: retry_after_header
+    description: "Equal weights, no CB. Client reads the Azure Retry-After response header and sleeps exactly that duration before retrying."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: retry_after
+    max_retries: 3
+    retry_delay_ms: 500
+
+  # ---------------------------------------------------------------------------
+  # Phase 2b — APIM server-side retry (client retry disabled)
+  # APIM retries the backend pool up to 3× on 429 before surfacing the error
+  # to the client. Each retry can be routed to a different pool member.
+  # ---------------------------------------------------------------------------
+
+  - id: apim_retry_equal
+    description: "Equal weights, no CB. APIM retries 429 up to 3× against the pool (1 s interval). Client sees only the final outcome."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: apim_retry_cb
+    description: "Equal weights, CB trips on 429+5xx. APIM retries against remaining non-tripped backends in the pool."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: apim_retry_asym
+    description: "90/5/5 weights, CB trips on 429+5xx. APIM retries route away from the saturated UK South backend, hitting WE and SC with fresher quota."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  # ---------------------------------------------------------------------------
+  # Phase 3 — optimal configuration candidates
+  # Filled after Phase 2 results are analysed. PLACEHOLDER retry_strategy values
+  # are replaced with the best-performing Phase 2a strategy before running.
+  # ---------------------------------------------------------------------------
+
+  - id: optimal_equal_client
+    description: "Best Phase 1 success-rate config (equal weights, no CB) + best Phase 2a client retry strategy. TBD after Phase 2."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    retry_strategy: PLACEHOLDER
+
+  - id: optimal_asym_client
+    description: "Best Phase 1 tail-latency config (90/5/5, CB on 429+5xx) + best Phase 2a client retry strategy. TBD after Phase 2."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    retry_strategy: PLACEHOLDER
+
+  - id: optimal_equal_apim
+    description: "Equal weights, no CB, APIM server-side retry only. Best single-layer APIM retry configuration from Phase 2b."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: optimal_asym_apim
+    description: "90/5/5 weights, CB on 429+5xx, APIM server-side retry only. Tests whether APIM retry compound with asymmetric CB outperforms either alone."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  # ---------------------------------------------------------------------------
+  # Sustained load — multiple quota windows
+  # Tests whether the winning config holds up beyond a single burst.
+  # CB trip-reset cycle (60s window) should be observable across 5 windows.
+  # ---------------------------------------------------------------------------
+
+  - id: sustained_apim_asym
+    description: "5-minute duration run of the winning config (90/5/5, CB on 429+5xx, APIM retry=3). Spans 5 × 60s quota windows to test CB trip-reset behaviour under continuous load."
+    vus: 20
+    duration: 5m
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: optimal_combined
+    description: "Fully-stacked: 90/5/5 weights, CB on 429+5xx, APIM retry (3×), and client backoff+jitter (3×). Tests whether both retry layers compound or conflict."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+    retry_strategy: backoff_jitter
+    max_retries: 3
+    retry_delay_ms: 500

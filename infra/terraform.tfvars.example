@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars and fill in real values.
+# terraform.tfvars is git-ignored — never commit it.
+
+subscription_id     = "00000000-0000-0000-0000-000000000000"
+publisher_name      = "Your Team Name"
+publisher_email     = "team@example.com"
+
+# Optional overrides (defaults defined in variables.tf are fine for most runs)
+# resource_group_name = "rg-apim-foundry-perf"
+# model_name          = "gpt-4o-mini"
+# model_version       = "2024-07-18"
+# quota_tpm           = 10000

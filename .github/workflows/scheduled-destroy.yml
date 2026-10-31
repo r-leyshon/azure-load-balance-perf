@@ -1,0 +1,82 @@
+name: Scheduled resource destroy
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC. Destroys resources once the destroy_after tag date has passed.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    # Allow manual trigger for early teardown.
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+env:
+  TF_WORKING_DIR: infra
+
+jobs:
+  check-and-destroy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read destroy_after tag
+        id: tag
+        env:
+          RG_NAME: ${{ vars.RESOURCE_GROUP_NAME || 'rg-apim-foundry-perf' }}
+        run: |
+          TAG=$(az group show --name "$RG_NAME" \
+            --query "tags.destroy_after" -o tsv 2>/dev/null || echo "")
+          echo "destroy_after=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resource group destroy_after tag: $TAG"
+
+      - name: Check whether expiry has passed
+        id: expired
+        run: |
+          TAG="${{ steps.tag.outputs.destroy_after }}"
+          TODAY=$(date -u +%Y-%m-%d)
+          if [[ -z "$TAG" ]]; then
+            echo "No destroy_after tag found — skipping destroy."
+            echo "should_destroy=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$TODAY" > "$TAG" || "$TODAY" == "$TAG" ]]; then
+            echo "Expiry date $TAG has passed (today: $TODAY) — will destroy."
+            echo "should_destroy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Expiry date $TAG has not passed (today: $TODAY) — skipping."
+            echo "should_destroy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Terraform
+        if: steps.expired.outputs.should_destroy == 'true'
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        if: steps.expired.outputs.should_destroy == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:        "true"
+        run: terraform init
+
+      - name: Terraform destroy
+        if: steps.expired.outputs.should_destroy == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID:              ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:              ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:        ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:               "true"
+          TF_VAR_subscription_id:     ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_publisher_name:      ${{ secrets.TF_PUBLISHER_NAME }}
+          TF_VAR_publisher_email:     ${{ secrets.TF_PUBLISHER_EMAIL }}
+        run: terraform destroy -auto-approve
