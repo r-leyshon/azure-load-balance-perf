@@ -10,10 +10,14 @@ const ITER          = parseInt(__ENV.ITER || "200");
 // "weighted"   — probabilistic selection by weight (60/25/15), no fallback.
 const MODE          = __ENV.DIRECT_MODE || "sequential";
 
+const WEIGHT_UKSOUTH       = parseInt(__ENV.WEIGHT_UKSOUTH       || "60");
+const WEIGHT_WESTEUROPE    = parseInt(__ENV.WEIGHT_WESTEUROPE    || "25");
+const WEIGHT_SWEDENCENTRAL = parseInt(__ENV.WEIGHT_SWEDENCENTRAL || "15");
+
 const ENDPOINTS = [
-  { url: __ENV.FOUNDRY_ENDPOINT_UKSOUTH,       key: __ENV.FOUNDRY_KEY_UKSOUTH,       region: "uksouth",       weight: 60 },
-  { url: __ENV.FOUNDRY_ENDPOINT_WESTEUROPE,    key: __ENV.FOUNDRY_KEY_WESTEUROPE,    region: "westeurope",    weight: 25 },
-  { url: __ENV.FOUNDRY_ENDPOINT_SWEDENCENTRAL, key: __ENV.FOUNDRY_KEY_SWEDENCENTRAL, region: "swedencentral", weight: 15 },
+  { url: __ENV.FOUNDRY_ENDPOINT_UKSOUTH,       key: __ENV.FOUNDRY_KEY_UKSOUTH,       region: "uksouth",       weight: WEIGHT_UKSOUTH },
+  { url: __ENV.FOUNDRY_ENDPOINT_WESTEUROPE,    key: __ENV.FOUNDRY_KEY_WESTEUROPE,    region: "westeurope",    weight: WEIGHT_WESTEUROPE },
+  { url: __ENV.FOUNDRY_ENDPOINT_SWEDENCENTRAL, key: __ENV.FOUNDRY_KEY_SWEDENCENTRAL, region: "swedencentral", weight: WEIGHT_SWEDENCENTRAL },
 ];
 
 for (const ep of ENDPOINTS) {

@@ -10,6 +10,15 @@ direct_runs:
     description: "Direct Foundry (no APIM) — weighted random selection 60/25/15 across regions. No fallback on failure."
     script: experiment/direct_test.js
     mode: weighted
+    weights: { uksouth: 60, westeurope: 25, swedencentral: 15 }
+    vus: 20
+    iterations: 200
+
+  - id: direct_equal
+    description: "Direct Foundry (no APIM) — weighted random selection 33/33/34, matching the APIM baseline weights. Fair pair for 'what does the gateway cost?' comparison."
+    script: experiment/direct_test.js
+    mode: weighted
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
     vus: 20
     iterations: 200
 
@@ -241,7 +250,7 @@ runs:
     apim_retry_interval_s: 1
 
   - id: optimal_combined
-    description: "Fully-stacked: 90/5/5 weights, CB on 429+5xx, APIM retry (3×), and client backoff+jitter (3×). Tests whether both retry layers compound or conflict."
+    description: "Fully-stacked: 90/5/5 weights, CB on 429+5xx, APIM retry (3×), and client retry_after backstop. Client layer fires only when APIM exhausts its retries."
     vus: 20
     iterations: 200
     weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
@@ -250,6 +259,111 @@ runs:
     circuit_breaker_on_429: true
     apim_retry_count: 3
     apim_retry_interval_s: 1
-    retry_strategy: backoff_jitter
+    retry_strategy: retry_after
     max_retries: 3
     retry_delay_ms: 500
+
+  # ---------------------------------------------------------------------------
+  # Ablation — winning corner fully decomposed
+  # Each run removes or modifies exactly one element of the winning stack
+  # (90/5/5 weights, CB trips on 429+5xx after 3 failures, APIM retry=3)
+  # to identify which components are doing the work.
+  # ---------------------------------------------------------------------------
+
+  - id: asym_retry_no_cb
+    description: "90/5/5 weights, APIM retry=3, CB disabled. Tests whether asymmetric weight alone is sufficient — i.e. does the circuit breaker add anything when skew is high?"
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: asym_retry_cb_5xx
+    description: "90/5/5 weights, APIM retry=3, CB trips on 5xx only (429 ignored). Tests whether the CB must treat quota exhaustion as a failure signal, or whether 5xx-only is sufficient."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: false
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: weight_70_15_15
+    description: "70/15/15 weights, CB on 429+5xx after 3 failures, APIM retry=3. Weight sweep — less aggressive skew than 90/5/5."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 70, westeurope: 15, swedencentral: 15 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: weight_80_10_10
+    description: "80/10/10 weights, CB on 429+5xx after 3 failures, APIM retry=3. Weight sweep — between 70/15/15 and 90/5/5."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 80, westeurope: 10, swedencentral: 10 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: trip_count_1
+    description: "90/5/5, CB trips on first 429 or 5xx (count=1), APIM retry=3. Tests whether immediate CB trip eliminates the 1.1% miss seen in sustained_apim_asym."
+    vus: 20
+    iterations: 200
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 1
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  # ---------------------------------------------------------------------------
+  # Sustained load — additional 5-minute runs for steady-state comparison
+  # ---------------------------------------------------------------------------
+
+  - id: sustained_baseline
+    description: "5-minute baseline: equal weights, no CB, no APIM retry. Control to check whether baseline recovers between quota windows or stays flat."
+    vus: 20
+    duration: 5m
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 0
+
+  - id: sustained_apim_retry_cb
+    description: "5-minute run of apim_retry_cb (equal weights, CB on 429+5xx, APIM retry=3). Tests whether equal-weight 100% burst result holds across multiple quota windows or degrades."
+    vus: 20
+    duration: 5m
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: sustained_trip_count_1
+    description: "5-minute run with CB trip count=1 (90/5/5, APIM retry=3). Confirms or refutes whether count=1 closes the 1.1% miss in sustained_apim_asym."
+    vus: 20
+    duration: 5m
+    weights: { uksouth: 90, westeurope: 5, swedencentral: 5 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 1
+    circuit_breaker_on_429: true
+    apim_retry_count: 3
+    apim_retry_interval_s: 1
+
+  - id: sustained_cb_only
+    description: "5-minute circuit-breaker-only run (equal weights, CB on 429+5xx, no APIM retry). Shows whether the pool drains and stays empty between resets — the production failure mode of shipping a CB without a pool retry."
+    vus: 20
+    duration: 5m
+    weights: { uksouth: 33, westeurope: 33, swedencentral: 34 }
+    gateway_rpm_limit: 10000
+    circuit_breaker_failure_count: 3
+    circuit_breaker_on_429: true
+    apim_retry_count: 0
