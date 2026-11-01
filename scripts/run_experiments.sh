@@ -310,7 +310,7 @@ CAR_EXPERIMENTS["car_baseline"]="10 5m 33 33 34 10000 0 true 0 1"
 CAR_EXPERIMENTS["car_90_5_5"]="10 5m 90 5 5 10000 0 false 0 1"
 # CB on 5xx only — should be transparent (no 5xx in quota saturation).
 CAR_EXPERIMENTS["car_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 0 1"
-# APIM retry on spill: retries from UK South 429s should route to WE/SC via acceptRetryAfter.
+# APIM retry on spill, unguided: retries re-enter 90/5/5 pool (no CB to remove UK South).
 CAR_EXPERIMENTS["car_retry_90_5_5"]="10 5m 90 5 5 10000 0 false 3 1"
 # Recommended production stack: 90/5/5 + CB on 5xx only + APIM retry.
 CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 3 1"

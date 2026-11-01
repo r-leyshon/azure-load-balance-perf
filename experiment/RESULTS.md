@@ -447,13 +447,15 @@ chance of landing on UK South again.
 **What the comparison reveals:**
 
 - If `car_retry_cb429_90_5_5` substantially outperforms `car_retry_90_5_5` and
-  `car_retry_cb5xx_90_5_5`: the mechanism is CB-on-429 removing the primary, not retry alone.
-  The PRODUCTION_GUIDE recommendation should be CB-on-429+5xx + retry (not CB-on-5xx-only +
-  retry) when the goal is routing around a saturated primary.
+  `car_retry_cb5xx_90_5_5`: the mechanism is CB-on-429 removing the primary from the pool
+  (which lifts *first attempts* as well as retries once the trip sticks — attribute success to
+  "CB diversion + retry helps during the ramp-up," not retry alone). The PRODUCTION_GUIDE
+  recommendation should be CB-on-429+5xx + retry (not CB-on-5xx-only + retry).
 - If `car_retry_90_5_5` also delivers high success: APIM has undocumented pool exclusion
   behaviour after a 429; the CB setting matters less. The recommendation stands as written.
-- In either case, if both retry configs substantially beat `car_90_5_5`: APIM retry is validated
-  as beneficial in the single-region-spill regime, resolving the "unvalidated extrapolation" flag.
+- If all three retry arms (`car_retry_90_5_5`, `car_retry_cb5xx_90_5_5`,
+  `car_retry_cb429_90_5_5`) substantially beat `car_90_5_5`: APIM retry is validated as
+  beneficial in the single-region-spill regime, resolving the "unvalidated extrapolation" flag.
 
 ---
 
