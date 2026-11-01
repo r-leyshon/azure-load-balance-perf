@@ -314,6 +314,9 @@ CAR_EXPERIMENTS["car_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 0 1"
 CAR_EXPERIMENTS["car_retry_90_5_5"]="10 5m 90 5 5 10000 0 false 3 1"
 # Recommended production stack: 90/5/5 + CB on 5xx only + APIM retry.
 CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 3 1"
+# CB on 429+5xx + retry: UK South trips on 429s and is removed from the pool, so retries
+# are forced to WE/SC. Tests whether routing to fallbacks requires CB-on-429.
+CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="10 5m 90 5 5 10000 3 true 3 1"
 
 # ---------------------------------------------------------------------------
 # Direct experiment definitions
@@ -354,7 +357,7 @@ SUSTAINED="sustained_apim_asym sustained_baseline sustained_apim_retry_cb sustai
 ABLATION="asym_retry_no_cb asym_retry_cb_5xx weight_70_15_15 weight_80_10_10 trip_count_1"
 DIRECT="direct_sequential direct_weighted direct_equal"
 ADAPTIVE="adaptive_burst adaptive_sustained"
-CAR="car_baseline car_90_5_5 car_cb5xx_90_5_5 car_retry_90_5_5 car_retry_cb5xx_90_5_5"
+CAR="car_baseline car_90_5_5 car_cb5xx_90_5_5 car_retry_90_5_5 car_retry_cb5xx_90_5_5 car_retry_cb429_90_5_5"
 
 ALL_ORDERED="$PHASE1 $PHASE2A $PHASE2B $PHASE3 $SUSTAINED $ABLATION"
 

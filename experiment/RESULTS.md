@@ -392,43 +392,68 @@ while leaving WE and SC well below theirs (~0.5 req/s vs 6.67 cap). This is the
 **single-region-spill regime**: the scenario a real PTU primary + PAYG fallbacks deployment faces
 during normal peak load, as opposed to the global saturation tested in Phases 1–3.
 
+**Calibration gate:** `car_baseline` must reach ~95–100% success before the spill math is trusted.
+If it falls short, the 6.67 req/s/region capacity assumption is wrong (token count may differ) and
+the arrival rate should be reduced before interpreting `car_90_5_5` results.
+
+**Dropped iterations:** the k6 summary reports `dropped_iterations` when all pre-allocated VUs are
+busy and a new arrival cannot be assigned a slot. If non-zero, the constant-arrival-rate guarantee
+is broken for those requests (they were never sent). Check this metric before drawing conclusions.
+
 ### Experiments
 
 | run_id | weights | CB | APIM retry | purpose |
 |---|---|---|---|---|
-| `car_baseline` | 33/33/34 | none | none | No saturation (3.3 req/s per backend < 6.67 cap) — sanity anchor |
-| `car_90_5_5` | 90/5/5 | none | none | Primary spill, no recovery mechanism |
-| `car_cb5xx_90_5_5` | 90/5/5 | 5xx only | none | CB transparent under quota 429s — expected identical to `car_90_5_5` |
-| `car_retry_90_5_5` | 90/5/5 | none | count=3 | APIM retry routes UK South 429s to WE/SC via `acceptRetryAfter` |
-| `car_retry_cb5xx_90_5_5` | 90/5/5 | 5xx only | count=3 | Recommended production stack under its intended load regime |
+| `car_baseline` | 33/33/34 | none | none | Calibration gate: no saturation expected (3.3 req/s per backend < 6.67 cap) |
+| `car_90_5_5` | 90/5/5 | none | none | Primary spill with no recovery — sets the unassisted ceiling |
+| `car_cb5xx_90_5_5` | 90/5/5 | 5xx only | none | CB transparent under quota-only 429s — expected identical to `car_90_5_5` |
+| `car_retry_90_5_5` | 90/5/5 | none | count=3 | Retry on spill, unguided: retries re-enter 90/5/5 pool (UK South ~90% of retries) |
+| `car_retry_cb5xx_90_5_5` | 90/5/5 | 5xx only | count=3 | Same pool re-selection issue — CB on 5xx doesn't remove UK South on 429s |
+| `car_retry_cb429_90_5_5` | 90/5/5 | 429+5xx | count=3 | Retry with UK South CB-tripped: retries forced to WE/SC (the mechanism that actually routes around the primary) |
 
 ### Results
 
 > **Pending** — experiments not yet run. Requires live infra and PIM activation.
 
 <!-- Replace this block with the summarise.py output table after running:
-     bash scripts/run_experiments.sh car_baseline car_90_5_5 car_cb5xx_90_5_5 car_retry_90_5_5 car_retry_cb5xx_90_5_5
+     bash scripts/run_experiments.sh car_baseline car_90_5_5 car_cb5xx_90_5_5 \
+       car_retry_90_5_5 car_retry_cb5xx_90_5_5 car_retry_cb429_90_5_5
 -->
 
 ### Hypotheses
 
-- `car_baseline`: ~100% success. No backend saturates; this is the control case.
-- `car_90_5_5`: ~70–77% success. UK South serves requests up to quota (6.67/9 req/s = 74%), the
-  rest receive 429. WE/SC serve their small allocations at ~100%. No recovery mechanism.
-- `car_cb5xx_90_5_5`: identical to `car_90_5_5`. CB on 5xx never fires; the configuration is
-  transparent under quota-only failures.
-- `car_retry_90_5_5`: substantially higher success than `car_90_5_5`. When UK South returns 429,
-  APIM's `acceptRetryAfter` marks it as temporarily unavailable and routes retries to WE/SC, which
-  have ample remaining quota. Unlike the global-saturation case, retries actually find fresh
-  capacity. This is the experiment that validates or falsifies the PRODUCTION_GUIDE retry
-  recommendation.
-- `car_retry_cb5xx_90_5_5`: similar to `car_retry_90_5_5`. Adding CB on 5xx provides a safety net
-  for hard backend failures without interfering with quota routing.
+The core mechanistic question is whether retries **actually route to WE/SC** or just re-hit UK
+South. `acceptRetryAfter` is a circuit-breaker property: it extends a CB trip duration using the
+backend's `Retry-After` header. It only applies once the CB has tripped. With CB off or CB on 5xx
+only, UK South is never removed from the pool, so retries re-enter the 90/5/5 pool and have a 90%
+chance of landing on UK South again.
 
-If the hypotheses hold, the key finding will be: **APIM retry is beneficial under single-region
-spill (the intended production use case) but harmful under global saturation (the sandbox
-worst-case)**. That resolves the flag in the PRODUCTION_GUIDE and converts the current
-"unvalidated extrapolation" to a supported recommendation.
+- `car_baseline`: ~95–100% success. No backend saturates; this is the calibration control.
+- `car_90_5_5`: ~70–77% success. UK South handles requests up to its quota ceiling (6.67/9 req/s
+  = ~74%); excess requests receive 429. WE/SC serve their 0.5 req/s each at ~100%. No recovery.
+- `car_cb5xx_90_5_5`: identical to `car_90_5_5`. CB on 5xx never fires under quota-only failures.
+- `car_retry_90_5_5`: **small lift over `car_90_5_5` at best.** Retries re-enter the 90/5/5 pool
+  with no CB to remove UK South. ~90% of retries land on UK South again; only the ~10% that
+  randomly route to WE/SC succeed. Expected ~74% + ~10% of failed × (10% routing) ≈ 75–78%.
+  If the actual result is substantially higher, APIM has undocumented "exclude-last-failure"
+  behaviour that this experiment would reveal.
+- `car_retry_cb5xx_90_5_5`: identical to `car_retry_90_5_5`. CB on 5xx doesn't fire on 429s;
+  UK South stays in the pool.
+- `car_retry_cb429_90_5_5`: **substantial lift expected.** UK South trips on N×429s and is removed
+  from the pool. All retries route to WE/SC, which have ample quota. This is the mechanism that
+  actually delivers "retry finds fresh capacity." With 90/5/5 weights the pool-drain risk is low
+  (fallbacks only see 0.5 req/s each before the primary trips, nowhere near exhausting their quota).
+
+**What the comparison reveals:**
+
+- If `car_retry_cb429_90_5_5` substantially outperforms `car_retry_90_5_5` and
+  `car_retry_cb5xx_90_5_5`: the mechanism is CB-on-429 removing the primary, not retry alone.
+  The PRODUCTION_GUIDE recommendation should be CB-on-429+5xx + retry (not CB-on-5xx-only +
+  retry) when the goal is routing around a saturated primary.
+- If `car_retry_90_5_5` also delivers high success: APIM has undocumented pool exclusion
+  behaviour after a 429; the CB setting matters less. The recommendation stands as written.
+- In either case, if both retry configs substantially beat `car_90_5_5`: APIM retry is validated
+  as beneficial in the single-region-spill regime, resolving the "unvalidated extrapolation" flag.
 
 ---
 

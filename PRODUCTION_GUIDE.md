@@ -33,7 +33,7 @@ that they are rarely used but high enough to absorb a full PTU failover. 5/5 ach
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `statusCodeRanges` | 500–599 only | Sandbox finding: CB on 5xx only is the fastest configuration tested. APIM retry handles quota redistribution; the CB should protect against hard backend failures only. Treating 429 as a CB signal adds no benefit and risks draining the pool. |
+| `statusCodeRanges` | 500–599 only (see caveat) | CB on 5xx only protects against hard backend failures without touching quota redistribution. **Caveat:** if APIM retry is also enabled, retries re-enter the weighted pool with no guarantee of avoiding the 429-ing primary — unless that primary has been CB-tripped and removed. CB on 429+5xx is likely needed for retries to reliably route to fallbacks; the trade-off is pool-drain risk when all backends fail simultaneously (low risk with 90/5/5 weights). Phase 4 CAR experiments will clarify which CB setting pairs correctly with retry. |
 | `count` (trip threshold) | 3 | Trip threshold 1 vs 3 made no meaningful difference in sustained runs. 3 is more resilient to transient single failures. |
 | `interval` (evaluation window) | PT60S | Matches Azure OpenAI's quota replenishment window. |
 | `tripDuration` | PT60S | Matches Azure OpenAI's quota replenishment window. Set in `apim_backends.tf`. The sandbox data suggests the full 60s is appropriate: a backend that tripped on quota exhaustion needs the full window to reset before it can serve requests again. |
@@ -53,7 +53,14 @@ that they are rarely used but high enough to absorb a full PTU failover. 5/5 ach
 > retry is harmful at sustained load: each incoming request generates up to 3 retries that
 > re-exhaust quota the moment a window resets, giving 0.3% sustained success vs 2.4% with no
 > retry. In the PTU+PAYG production scenario this setting is designed for — where the PTU
-> saturates but PAYG fallbacks have capacity — retries route to the open fallbacks and succeed.
+> saturates but PAYG fallbacks have capacity — retries should route to open fallbacks.
+>
+> **Routing caveat:** retries re-enter the weighted pool. Without CB on 429+5xx, the 429-ing
+> primary is still in the pool and absorbs ~90% of retries (with 90/5/5 weights). `acceptRetryAfter`
+> only redirects traffic once the CB has tripped — it is not a standalone routing mechanism.
+> Phase 4 constant-arrival-rate experiments will confirm whether CB on 5xx only is sufficient or
+> whether CB on 429+5xx is required for retries to reliably reach the PAYG fallbacks.
+>
 > If you observe PAYG fallbacks also saturating under normal load, reduce retry count to 1 or 0
 > and rely on client-side `Retry-After` instead.
 
