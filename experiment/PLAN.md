@@ -1,5 +1,10 @@
 # Experiment Plan: Retry Strategies and Optimal Configuration
 
+> **Note:** This plan was written before two correctness bugs were discovered and fixed.
+> Results referenced here (including `cb_5xx_only` at 3.0%, Phase 2b 100% claims, and
+> Phase 3 "winning stack" analysis) reflect bleed-contaminated or pre-fix data. See
+> [`RESULTS.md`](RESULTS.md) for the correct findings.
+
 ## Context
 
 Phase 1 experiments characterised the behaviour of APIM load balancing, circuit breaking, and

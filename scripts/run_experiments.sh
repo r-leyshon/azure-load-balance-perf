@@ -44,7 +44,8 @@ run_experiment() {
   echo "========================================"
 
   # Wait for any prior circuit-breaker trip state to expire before applying.
-  # APIM CB state is ephemeral in-memory; PT30S trip duration means 60s is safe.
+  # APIM CB state is ephemeral in-memory with PT60S trip duration (set in apim_backends.tf).
+  # 60s sleep + terraform apply time (~5-15s) gives a total gap comfortably above PT60S.
   echo "  Waiting 60s for CB state to clear..."
   sleep 60
 

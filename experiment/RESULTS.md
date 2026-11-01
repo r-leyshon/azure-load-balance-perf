@@ -14,10 +14,12 @@ single-sentence prompt with `max_tokens: 5`.
 > backend selection without actually forwarding the request; APIM returned synthetic 200s from
 > its own layer. All 14 experiments with APIM retry enabled were re-run after the fix.
 >
-> **Bug 2:** APIM circuit-breaker state is in-memory with a PT30S trip duration. It survives
-> `terraform apply` of new policy configurations. Experiments whose terraform apply completed
-> faster than the 30-second trip window inherited tripped backends from the previous run. Nine
-> experiments were re-run with an explicit 60-second isolation gap added to `run_experiments.sh`.
+> **Bug 2:** APIM circuit-breaker state is in-memory with a PT60S trip duration (set in
+> `apim_backends.tf`; not PT30S as earlier notes incorrectly stated). It survives `terraform
+> apply` of new policy configurations. Experiments whose terraform apply completed in under ~60
+> seconds inherited tripped backends from the previous run. Nine experiments were re-run with an
+> explicit 60-second isolation gap added to `run_experiments.sh`. Combined with terraform apply
+> time (~5–15s), the total gap comfortably exceeds PT60S.
 >
 > Every table in this document reflects clean, isolation-verified data only.
 
@@ -80,9 +82,15 @@ without resilience features.
 
 | run_id | weights | http_200_% | p50_ms | goodput (req/s) | notes |
 |---|---|---|---|---|---|
-| direct_sequential | UK→WE→SC fallback | 5.8 | 101.1 | 6.2 | 567 HTTP calls for 33 successes |
+| direct_sequential | UK→WE→SC fallback | 16.5 ² | 101.1 | 6.2 | |
 | direct_weighted | 60/25/15 | 16.5 | 94.2 | 11.1 | |
 | direct_equal | 33/33/34 | 17.5 | 104.4 | 3.1 | matched pair with baseline |
+
+² `direct_sequential` makes up to 3 HTTP calls per k6 iteration (UK→WE→SC fallback chain),
+producing 567 total HTTP calls for 200 k6 iterations. `summarise.py` uses HTTP calls as the
+denominator (the `original_iterations` counter is absent in `direct_test.js`), reporting 5.8%.
+The correct per-request success rate is 33 ÷ 200 = **16.5%**, in line with `direct_equal` and
+`baseline`. Sequential fallback offers no measurable advantage over a single-endpoint call.
 
 ### Phase 1 findings
 
@@ -210,11 +218,11 @@ Client retry disabled for isolation.
 - **`optimal_equal_apim` (equal, no CB, APIM retry): 18.0%** — consistent with `apim_retry_equal`
   (18.5%). Equal weights with no CB is the reliable best without client-side retry.
 
-- **`optimal_asym_apim` (90/5/5, CB on 429+5xx, APIM retry): 5.5%** — this uses the same
-  configuration as `apim_retry_asym` (18.0% in Phase 2b). The discrepancy reflects inherent
-  quota-timing variance: with 10 000 TPM and tests completing in 6–10 seconds, results shift
-  significantly depending on where in the 60-second quota cycle the test starts. Single-run
-  estimates for this configuration should be treated as 5–18% range.
+- **`optimal_asym_apim` (90/5/5, CB on 429+5xx, APIM retry): 5.5%** — this uses the identical
+  configuration as `apim_retry_asym` (18.0% in Phase 2b). The discrepancy is quota-timing
+  variance: with 10 000 TPM and tests completing in 6–10 seconds, success rate depends strongly
+  on where the test lands in the 60-second quota window. Neither run is more "correct" than the
+  other. This configuration should be treated as 5–18% range, not a point estimate.
 
 - **`optimal_combined` (90/5/5 + CB + APIM retry + client `Retry-After`): 16.5%, 2.5 seconds.**
   The 2.5-second duration means the 30-second `Retry-After` never fires — this result is

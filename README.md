@@ -52,28 +52,45 @@ production-scale traffic to observe.
 
 ## Key findings
 
-| Config | Success rate | Goodput (req/s) |
-|---|---|---|
-| No resilience features (baseline) | 17.5% | 6.8 |
-| Circuit breaker only (equal weights) | 4.5% | 3.7 |
-| Asymmetric weights + CB | 16.5% | 8.5 |
-| APIM retry, no CB | 16.5% | 11.2 |
-| **APIM retry + CB (equal weights)** | **100%** | **153** |
-| **APIM retry + CB (90/5/5 weights)** | **100%** | **160** |
-| Client retry (`Retry-After` header) | 99.5% | 0.4 |
-| Sustained 5-min run (winning config) | 98.9% | 164 |
+All experiments ran under deliberate global quota saturation (10 000 TPM × 3 regions, 20 VUs).
+This is the worst-case regime: every backend is simultaneously exhausted within seconds.
 
-**APIM server-side retry combined with per-backend circuit breakers is the decisive combination.**
-Circuit breakers remove saturated backends from the pool; APIM retries then find a backend with
-remaining quota. The entire recovery is invisible to the caller at ~14ms p50 latency.
+| Config | Burst success | Sustained (5 min) | Goodput burst |
+|---|---|---|---|
+| No features (baseline) | 17.5% | 2.4% | 6.8 |
+| CB on 429+5xx, equal weights | 4.5% | — | 3.7 |
+| CB on 429+5xx, 90/5/5 weights | 16.5% | — | 8.5 |
+| CB on 5xx only, equal weights | 16.5% | — | 5.9 |
+| APIM retry=3, no CB | **18.5%** | — | 2.9 |
+| APIM retry=3 + CB on 429+5xx, equal | 4.5% | 0.3% | 1.1 |
+| APIM retry=3 + CB on 429+5xx, 90/5/5 | 18% | 0.3% | 3.7 |
+| CB on 429+5xx only, no retry (sustained) | — | **2.8%** | 4.6 |
+| Client retry (`Retry-After` header) | 99.5% | — | 0.4 |
 
-Client-side retry strategies are largely counterproductive under global quota saturation — the
-only effective variant is sleeping for the exact `Retry-After` duration returned by Azure, which
-achieves ~100% success but at ~30 second median latency, making it suitable only for batch
+**The dominant finding is about sustained load, not burst.** APIM retry transforms quota
+exhaustion into an amplification storm under sustained saturation: each request generates up to
+3 retries that re-exhaust the quota window the moment it resets. Configurations with APIM retry
+drop from ~18% burst to 0.3% sustained — 8× worse than doing nothing (2.4%). Circuit breaker
+*without* retry is the best sustained APIM configuration (2.8%), because CB fails fast, waits
+for the 60-second trip duration, and pounces on the quota window at reset.
+
+**Burst results are systematically misleading** for quota-limited gateways. `baseline` scores
+17.5% burst but 2.4% sustained. Any honest characterisation requires multi-window sustained runs.
+
+**CB on 5xx only is the correct production CB setting.** It is neutral under quota saturation
+(never fires — all failures are 429s), and protects against hard backend failures. CB on 429+5xx
+is harmful with equal weights (all backends drain simultaneously) and potentially harmful over
+sustained load with APIM retry.
+
+**Experiment scope:** these tests use identical tiny quotas across all three regions, forcing
+*global* saturation. A real PTU + PAYG deployment — where the primary has high capacity and
+PAYG fallbacks have fresh quota — is a different regime. APIM retry likely performs much better
+when only the primary saturates. See [`experiment/RESULTS.md`](experiment/RESULTS.md) for the
+full analysis and caveats.
+
+Client-side retry strategies are counterproductive except for the `Retry-After` header variant,
+which achieves ~100% eventual success at ~30-second median latency. Suitable only for batch
 workloads.
-
-See [`experiment/RESULTS.md`](experiment/RESULTS.md) for the full table, per-phase findings, and
-discussion of each experiment.
 
 ---
 

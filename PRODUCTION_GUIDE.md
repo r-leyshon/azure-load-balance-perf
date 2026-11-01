@@ -5,9 +5,11 @@ Foundry deployment. It covers recommended configuration values, infrastructure c
 strategy, alert rules, and a tuning reference for ongoing operations.
 
 The sandbox used 10 000 TPM quotas and a Developer_1 APIM tier. Neither is representative of
-production — but the *ratios and failure modes* are. The guidance below is opinionated: where the
-data pointed clearly, a specific value is given. Where production conditions introduce genuine
-uncertainty (e.g. PTU sizing), ranges are given with the reasoning to make your own call.
+production — but the failure modes are. **One important scope caveat:** every sandbox experiment
+forced *global* saturation — all three regions simultaneously exhausted. A real PTU + PAYG
+deployment, where the primary region has high provisioned throughput and the PAYG fallbacks have
+fresh quota, is a materially different regime. Where sandbox findings diverge from the expected
+production scenario, this is noted explicitly below.
 
 ---
 
@@ -38,16 +40,24 @@ simultaneously. Stay either side of 80: use 90/5/5 or 70/15/15.
 | `statusCodeRanges` | 500–599 only | Sandbox finding: CB on 5xx only is the fastest configuration tested. APIM retry handles quota redistribution; the CB should protect against hard backend failures only. Treating 429 as a CB signal adds no benefit and risks draining the pool. |
 | `count` (trip threshold) | 3 | Trip threshold 1 vs 3 made no meaningful difference in sustained runs. 3 is more resilient to transient single failures. |
 | `interval` (evaluation window) | PT60S | Matches Azure OpenAI's quota replenishment window. |
-| `tripDuration` | PT30S | Half the quota window. The backend is usually recovering by this point; a full 60s trip wastes capacity at window reset. Start here and tune down if you see backends stay tripped unnecessarily. |
+| `tripDuration` | PT60S | Matches Azure OpenAI's quota replenishment window. Set in `apim_backends.tf`. The sandbox data suggests the full 60s is appropriate: a backend that tripped on quota exhaustion needs the full window to reset before it can serve requests again. |
 | `acceptRetryAfter` | true | Lets APIM honour the backend's own retry guidance when available. |
 
 ### APIM server-side retry
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `count` | 3 | Enough retries to exhaust WE and SC fallbacks before surfacing an error. With 90/5/5 weights, retries will almost always find fresh capacity on the first or second retry. |
+| `count` | 3 | With 90/5/5 weights and a PTU primary that saturates while PAYG fallbacks have headroom, retries will almost always find fresh capacity on the first or second retry. |
 | `interval` | 1s | Short enough to be transparent to callers; long enough for APIM to re-evaluate the pool after a CB trip. Increase if retry storms surface in logs. |
 | `condition` | `context.Response.StatusCode == 429` | Only retry on quota exhaustion, not on all failures. 5xx from the backend should trip the CB, not trigger a retry loop. |
+
+> **Sandbox caveat:** under *global* saturation (all backends simultaneously exhausted), APIM
+> retry is harmful at sustained load: each incoming request generates up to 3 retries that
+> re-exhaust quota the moment a window resets, giving 0.3% sustained success vs 2.4% with no
+> retry. In the PTU+PAYG production scenario this setting is designed for — where the PTU
+> saturates but PAYG fallbacks have capacity — retries route to the open fallbacks and succeed.
+> If you observe PAYG fallbacks also saturating under normal load, reduce retry count to 1 or 0
+> and rely on client-side `Retry-After` instead.
 
 ### Gateway RPM limit
 
@@ -225,9 +235,11 @@ normal (no-CB-trip) conditions.
 | PTU returning 429s faster than expected | Reduce PTU weight to shift earlier to PAYG | PAYG costs increase; monitor token spend |
 | PTU incidents (regional outage) | Emergency: set PTU weight to 0 via Terraform; PAYG handles 100% | PAYG capacity limits; watch Azure quota consumption |
 
-**Never set 80/10/10.** The sandbox identified this as a dangerous midpoint where the
-fallback pool is large enough to route significant traffic but small enough to simultaneously
-exhaust. Use 70/15/15 or 90/5/5.
+**No dangerous midpoint was confirmed.** Early analysis flagged 80/10/10 as harmful, but this
+was a measurement artefact (CB state bleed between experiments). After proper isolation, 80/10/10
+achieves the same ~16–18% burst success as 70/15/15 and 90/5/5. Weight distribution within the
+asymmetric range does not strongly predict burst success under global saturation. Use 90/5/5 as
+the production starting point to maximise PTU utilisation and minimise PAYG cost.
 
 ---
 
@@ -256,11 +268,10 @@ clearly distinguishable from transient errors (i.e. you have confidence in the s
 | Backends re-entering the pool before they have recovered, causing immediate re-trip | Increase (e.g. PT30S → PT60S → PT120S) | Longer trip duration = more traffic on remaining backends during recovery |
 | Backends staying out of the pool long after they have recovered, wasting capacity | Decrease (e.g. PT60S → PT30S) | Too short and you reintroduce a flapping pattern |
 
-**Recommended starting value: PT30S.** This is shorter than Azure's 60-second quota window,
-which matters for 429-driven scenarios — though with the recommended CB-on-5xx-only config,
-this primarily governs hard failure recovery time. Azure service incidents typically resolve
-within minutes; PT30S is aggressive but appropriate for a gateway that has retry to absorb the
-re-entry traffic.
+**Recommended starting value: PT60S** (the value set in `apim_backends.tf`). This matches
+Azure OpenAI's quota replenishment window. With CB-on-5xx-only, this governs hard failure
+recovery time rather than quota cycling. Azure service incidents typically resolve within
+minutes; PT60S ensures a fully recovered backend before re-admission.
 
 ---
 
@@ -375,7 +386,7 @@ backend_weight_swedencentral = 5
 
 circuit_breaker_failure_count = 3
 circuit_breaker_on_429        = false   # 5xx only — key finding from sandbox
-# tripDuration set in apim_backends.tf to "PT30S"
+# tripDuration set in apim_backends.tf to "PT60S"
 
 apim_retry_count      = 3
 apim_retry_interval_s = 1
