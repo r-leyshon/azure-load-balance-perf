@@ -1,3 +1,23 @@
+adaptive_runs:
+
+  - id: adaptive_burst
+    description: "Per-VU adaptive weights — 200 iterations (cold start). Weights start equal (33/33/34) and recompute every 30s based on score = successes - 5×errors with 5% epsilon floor. At burst throughput the adaptation window does not fire; this shows equal-weight performance as the cold-start baseline for comparison with adaptive_sustained."
+    script: experiment/adaptive_test.js
+    vus: 20
+    iterations: 200
+    adapt_interval_s: 30
+    error_penalty: 5
+    epsilon: 0.05
+
+  - id: adaptive_sustained
+    description: "Per-VU adaptive weights — 5-minute duration. Same algorithm as adaptive_burst. Each VU sees ~10 update cycles; weights should converge away from consistently saturated regions. Compare against sustained_baseline (APIM, static equal weights, no CB/retry) and direct_equal (static equal, direct, burst)."
+    script: experiment/adaptive_test.js
+    vus: 20
+    duration: 5m
+    adapt_interval_s: 30
+    error_penalty: 5
+    epsilon: 0.05
+
 direct_runs:
   - id: direct_sequential
     description: "Direct Foundry (no APIM) — sequential fallback UK South → West Europe → Sweden Central. Baseline for APIM overhead measurement."

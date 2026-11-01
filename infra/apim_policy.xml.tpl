@@ -17,6 +17,7 @@
            interval="${apim_retry_interval_s}"
            first-fast-retry="false">
       <set-backend-service backend-id="foundry-pool" />
+      <forward-request />
     </retry>
 %{ else ~}
     <base />

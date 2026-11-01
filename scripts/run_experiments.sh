@@ -43,6 +43,11 @@ run_experiment() {
   echo "  Experiment: $id"
   echo "========================================"
 
+  # Wait for any prior circuit-breaker trip state to expire before applying.
+  # APIM CB state is ephemeral in-memory; PT30S trip duration means 60s is safe.
+  echo "  Waiting 60s for CB state to clear..."
+  sleep 60
+
   cd "$INFRA_DIR"
   terraform apply -auto-approve \
     -var "gateway_rpm_limit=$rpm" \
@@ -126,6 +131,64 @@ run_direct_experiment() {
 }
 
 # ---------------------------------------------------------------------------
+# run_adaptive_experiment  id  vus  iter_or_duration  adapt_s  penalty  epsilon
+#
+# Calls adaptive_test.js (Foundry API key auth, no APIM). Weights start equal
+# and are recomputed every adapt_s seconds based on per-VU success/error counts.
+# iter_or_duration may be an integer (iterations) or a duration string e.g. "5m".
+# ---------------------------------------------------------------------------
+run_adaptive_experiment() {
+  local id="$1"
+  local vus="$2"
+  local iter="$3"
+  local adapt_s="$4"
+  local penalty="$5"
+  local epsilon="$6"
+
+  echo ""
+  echo "========================================"
+  echo "  Adaptive experiment: $id"
+  echo "========================================"
+
+  cd "$REPO_ROOT"
+  if [[ "$iter" =~ ^[0-9]+[smh]$ ]]; then
+    k6 run \
+      -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+      -e FOUNDRY_ENDPOINT_UKSOUTH="$FOUNDRY_ENDPOINT_UKSOUTH" \
+      -e FOUNDRY_KEY_UKSOUTH="$FOUNDRY_KEY_UKSOUTH" \
+      -e FOUNDRY_ENDPOINT_WESTEUROPE="$FOUNDRY_ENDPOINT_WESTEUROPE" \
+      -e FOUNDRY_KEY_WESTEUROPE="$FOUNDRY_KEY_WESTEUROPE" \
+      -e FOUNDRY_ENDPOINT_SWEDENCENTRAL="$FOUNDRY_ENDPOINT_SWEDENCENTRAL" \
+      -e FOUNDRY_KEY_SWEDENCENTRAL="$FOUNDRY_KEY_SWEDENCENTRAL" \
+      -e RUN_ID="$id" \
+      -e VUS="$vus" \
+      -e DURATION="$iter" \
+      -e ADAPT_INTERVAL_S="$adapt_s" \
+      -e ERROR_PENALTY="$penalty" \
+      -e EPSILON="$epsilon" \
+      experiment/adaptive_test.js
+  else
+    k6 run \
+      -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+      -e FOUNDRY_ENDPOINT_UKSOUTH="$FOUNDRY_ENDPOINT_UKSOUTH" \
+      -e FOUNDRY_KEY_UKSOUTH="$FOUNDRY_KEY_UKSOUTH" \
+      -e FOUNDRY_ENDPOINT_WESTEUROPE="$FOUNDRY_ENDPOINT_WESTEUROPE" \
+      -e FOUNDRY_KEY_WESTEUROPE="$FOUNDRY_KEY_WESTEUROPE" \
+      -e FOUNDRY_ENDPOINT_SWEDENCENTRAL="$FOUNDRY_ENDPOINT_SWEDENCENTRAL" \
+      -e FOUNDRY_KEY_SWEDENCENTRAL="$FOUNDRY_KEY_SWEDENCENTRAL" \
+      -e RUN_ID="$id" \
+      -e VUS="$vus" \
+      -e ITER="$iter" \
+      -e ADAPT_INTERVAL_S="$adapt_s" \
+      -e ERROR_PENALTY="$penalty" \
+      -e EPSILON="$epsilon" \
+      experiment/adaptive_test.js
+  fi
+
+  echo "  Done: results written to experiment/results/${id}.json"
+}
+
+# ---------------------------------------------------------------------------
 # APIM experiment definitions
 # Format: "vus iter wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s retry_strategy max_retries retry_delay_ms"
 # ---------------------------------------------------------------------------
@@ -185,6 +248,23 @@ DIRECT_EXPERIMENTS["direct_weighted"]="20 200 weighted 60 25 15"
 DIRECT_EXPERIMENTS["direct_equal"]="20 200 weighted 33 33 34"   # matched pair with baseline
 
 # ---------------------------------------------------------------------------
+# Adaptive experiment definitions
+# Format: "vus iter_or_duration adapt_interval_s error_penalty epsilon"
+# Weights start equal. Each VU independently adjusts every adapt_interval_s
+# seconds based on its own success/error counts (score = success - penalty × errors).
+# ---------------------------------------------------------------------------
+
+declare -A ADAPTIVE_EXPERIMENTS
+# Burst: 200 iterations. At ~160 goodput the run ends in <2s; the 30s window
+# will not fire. This is intentional: it shows cold-start (equal-weight) behaviour
+# as the baseline for comparison with the sustained run.
+ADAPTIVE_EXPERIMENTS["adaptive_burst"]="20 200 30 5 0.05"
+# Sustained: 5 minutes, same adapt interval as burst. Each VU sees ~10 update
+# cycles. Compare against sustained_baseline (APIM, equal weights, no CB/retry)
+# and direct_equal (static equal weights, direct, burst only).
+ADAPTIVE_EXPERIMENTS["adaptive_sustained"]="20 5m 30 5 0.05"
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
@@ -195,6 +275,7 @@ PHASE3="optimal_equal_client optimal_asym_client optimal_equal_apim optimal_asym
 SUSTAINED="sustained_apim_asym sustained_baseline sustained_apim_retry_cb sustained_trip_count_1 sustained_cb_only"
 ABLATION="asym_retry_no_cb asym_retry_cb_5xx weight_70_15_15 weight_80_10_10 trip_count_1"
 DIRECT="direct_sequential direct_weighted direct_equal"
+ADAPTIVE="adaptive_burst adaptive_sustained"
 
 ALL_ORDERED="$PHASE1 $PHASE2A $PHASE2B $PHASE3 $SUSTAINED $ABLATION"
 
@@ -205,7 +286,11 @@ else
 fi
 
 for id in $ORDERED; do
-  if [ -n "${DIRECT_EXPERIMENTS[$id]+_}" ]; then
+  if [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
+    args="${ADAPTIVE_EXPERIMENTS[$id]}"
+    read -r vus iter adapt_s penalty epsilon <<< "$args"
+    run_adaptive_experiment "$id" "$vus" "$iter" "$adapt_s" "$penalty" "$epsilon"
+  elif [ -n "${DIRECT_EXPERIMENTS[$id]+_}" ]; then
     args="${DIRECT_EXPERIMENTS[$id]}"
     read -r vus iter mode wuk wwe wsc <<< "$args"
     run_direct_experiment "$id" "$vus" "$iter" "$mode" "$wuk" "$wwe" "$wsc"
