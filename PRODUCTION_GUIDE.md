@@ -29,10 +29,6 @@ production scenario, this is noted explicitly below.
 traffic as possible. PAYG fallbacks exist for PTU overflow, so their weights should be low enough
 that they are rarely used but high enough to absorb a full PTU failover. 5/5 achieves this.
 
-**What to avoid:** 80/10/10. The sandbox showed this creates a p95 latency spike because the
-10% fallback allocation is large enough to over-commit under load but small enough to exhaust
-simultaneously. Stay either side of 80: use 90/5/5 or 70/15/15.
-
 ### Circuit breaker
 
 | Parameter | Value | Rationale |
@@ -47,9 +43,11 @@ simultaneously. Stay either side of 80: use 90/5/5 or 70/15/15.
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `count` | 3 | With 90/5/5 weights and a PTU primary that saturates while PAYG fallbacks have headroom, retries will almost always find fresh capacity on the first or second retry. |
+| `count` | 3 ³ | Reasonable for PTU spillover (PTU saturates, PAYG fallbacks have capacity). **Unvalidated extrapolation — the sandbox only tested global saturation, where this count is actively harmful.** Confirm with a primary-saturated / fallbacks-fresh test before relying on it in production. |
 | `interval` | 1s | Short enough to be transparent to callers; long enough for APIM to re-evaluate the pool after a CB trip. Increase if retry storms surface in logs. |
 | `condition` | `context.Response.StatusCode == 429` | Only retry on quota exhaustion, not on all failures. 5xx from the backend should trip the CB, not trigger a retry loop. |
+
+³ When APIM exhausts all retries and the last backend response is still 429, APIM returns **503** to the caller — not 429. Client-side "retry on 429" logic will not fire for this path; callers should also handle 503 with backoff.
 
 > **Sandbox caveat:** under *global* saturation (all backends simultaneously exhausted), APIM
 > retry is harmful at sustained load: each incoming request generates up to 3 retries that
@@ -76,8 +74,13 @@ Advise callers to implement `Retry-After` header respect only. All other retry s
 they consume quota faster than it replenishes. If a caller is getting 429 from APIM it means the
 entire pool is saturated; any retry shorter than the `Retry-After` value will fail.
 
+> **503 vs 429:** when APIM server-side retry is enabled and exhausted, APIM returns **503 Service
+> Unavailable** to the caller, not 429. Client retry logic that only triggers on 429 will silently
+> pass through these failures. Callers should handle both 429 (pool not yet at retry budget) and
+> 503 (APIM retry budget exhausted) with the same `Retry-After`-respecting backoff.
+
 For interactive workloads, a single attempt with fast failure is preferable to a retry that
-blocks the caller thread for 30+ seconds. Surface the 429 to the caller and let them decide.
+blocks the caller thread for 30+ seconds. Surface the 429 or 503 to the caller and let them decide.
 
 ---
 

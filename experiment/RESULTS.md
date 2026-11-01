@@ -289,21 +289,21 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 ### Sustained load findings
 
 - **`sustained_cb_only` (CB, no APIM retry): 2.8%, 4.6 goodput — the best sustained APIM
-  configuration.** The CB trips backends within milliseconds of quota exhaustion. With PT30S
-  trip duration and no retry amplification, backends re-open after 30 seconds into a partially-
+  configuration.** The CB trips backends within milliseconds of quota exhaustion. With PT60S
+  trip duration and no retry amplification, backends re-open after 60 seconds into a partially-
   recovered quota window. Requests that arrive at the moment of re-opening complete in ~16ms.
   The CB acts as a rate limiter that synchronises with the quota cycle.
 
 - **`sustained_baseline` (no features): 2.4%.** Without CB, requests keep hitting exhausted
   backends and getting 429s. Some catch the brief window when quota has just reset. The result
   is only slightly worse than CB-only — the 0.4% difference comes from the CB's ability to
-  "park" the pool for 30 seconds and then pounce on the reset window.
+  "park" the pool for 60 seconds and then pounce on the reset window.
 
 - **`sustained_apim_retry_cb` and `sustained_apim_asym` both 0.3% — catastrophic.** This is
   the critical sustained finding. APIM retry transforms the quota exhaustion cycle into an
   amplification storm: each incoming request generates up to 3 retries, re-exhausting any
   briefly-recovered quota within milliseconds of the window resetting. The CB re-trips
-  immediately. The pattern repeats every 30 seconds, allowing only ~160 completions across the
+  immediately. The pattern repeats every 60 seconds, allowing only ~160 completions across the
   entire 5-minute window.
 
 - **APIM retry is neutral to marginally beneficial at burst (18%) but catastrophic at
@@ -349,7 +349,7 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 | retry_backoff | burst client | 13.0 | 107.2 | 0.6 |
 | retry_backoff_jitter | burst client | 13.0 | 107.0 | 0.6 |
 | retry_fixed_1s | burst client | 12.0 | 100.8 | 0.6 |
-| direct_sequential | burst direct | 5.8 | 101.1 | 6.2 |
+| direct_sequential | burst direct | 16.5 ² | 101.1 | 6.2 |
 | optimal_asym_apim | burst APIM | 5.5 | 24.6 | 1.6 |
 | sustained_apim_asym | sustained | 0.3 | 13.5 | 0.5 |
 | sustained_apim_retry_cb | sustained | 0.3 | 13.8 | 0.5 |
@@ -357,6 +357,8 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 | full_resilience | burst APIM | 0.0 | 11.6 | 0.0 |
 
 ¹ Goodput elevated by fast CB-induced 503s; not comparable with real-completion goodput.
+
+² `direct_sequential` makes up to 3 HTTP calls per iteration (UK→WE→SC fallback chain), giving 567 HTTP calls for 200 k6 iterations. `summarise.py` uses HTTP calls as the denominator (no `original_iterations` counter in `direct_test.js`), reporting 5.8%. Correct per-request rate: 33 ÷ 200 = **16.5%**.
 
 ---
 
@@ -386,7 +388,7 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 
 5. **CB without APIM retry is the best APIM strategy at sustained load: 2.8% vs 2.4% baseline.**
    Without retry amplification, the CB acts as a rate limiter that synchronises with the quota
-   cycle: backends trip fast, wait 30 seconds, re-open into a briefly-available quota window,
+   cycle: backends trip fast, wait 60 seconds, re-open into a briefly-available quota window,
    and some requests complete before the cycle repeats.
 
 6. **Client `Retry-After` achieves 99% eventual success at 30-second median latency.** This is
