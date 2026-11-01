@@ -132,6 +132,60 @@ run_direct_experiment() {
 }
 
 # ---------------------------------------------------------------------------
+# run_car_experiment  id  rate_per_s  duration  wt_uk  wt_we  wt_sc  rpm  cb  cb429
+#                     apim_retry  apim_retry_s
+#
+# Constant-arrival-rate load via car_test.js. Terraform is applied exactly as
+# in run_experiment(); only the k6 executor changes (open-loop rate instead of
+# closed-loop VUs). The 60-second CB-state isolation sleep still applies.
+# ---------------------------------------------------------------------------
+run_car_experiment() {
+  local id="$1"
+  local rate_per_s="$2"
+  local duration="$3"
+  local weight_uk="$4"
+  local weight_we="$5"
+  local weight_sc="$6"
+  local rpm="$7"
+  local cb="$8"
+  local cb429="${9:-true}"
+  local apim_retry="${10:-0}"
+  local apim_retry_s="${11:-1}"
+
+  echo ""
+  echo "========================================"
+  echo "  CAR experiment: $id"
+  echo "========================================"
+
+  echo "  Waiting 60s for CB state to clear..."
+  sleep 60
+
+  cd "$INFRA_DIR"
+  terraform apply -auto-approve \
+    -var "gateway_rpm_limit=$rpm" \
+    -var "circuit_breaker_failure_count=$cb" \
+    -var "circuit_breaker_on_429=$cb429" \
+    -var "backend_weight_uksouth=$weight_uk" \
+    -var "backend_weight_westeurope=$weight_we" \
+    -var "backend_weight_swedencentral=$weight_sc" \
+    -var "apim_retry_count=$apim_retry" \
+    -var "apim_retry_interval_s=$apim_retry_s" \
+    | tail -5
+
+  cd "$REPO_ROOT"
+  k6 run \
+    -e APIM_GATEWAY_URL="$APIM_GATEWAY_URL" \
+    -e APIM_SUBSCRIPTION_KEY="$APIM_SUBSCRIPTION_KEY" \
+    -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+    -e RUN_ID="$id" \
+    -e RATE_PER_S="$rate_per_s" \
+    -e DURATION="$duration" \
+    experiment/car_test.js
+
+  echo "  Done: results written to experiment/results/${id}.json"
+}
+
+# ---------------------------------------------------------------------------
 # run_adaptive_experiment  id  vus  iter_or_duration  adapt_s  penalty  epsilon
 #
 # Calls adaptive_test.js (Foundry API key auth, no APIM). Weights start equal
@@ -239,6 +293,29 @@ EXPERIMENTS["weight_80_10_10"]="20 200 80 10 10 10000 3 true 3 1 none 3 500"  # 
 EXPERIMENTS["trip_count_1"]="20 200 90 5 5 10000 1 true 3 1 none 3 500"       # CB trips on 1st failure
 
 # ---------------------------------------------------------------------------
+# Phase 4 — constant-arrival-rate (CAR) experiment definitions
+# Format: "rate_per_s duration wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s"
+#
+# Rate: 10 req/s ≈ 1.5× one region's 6.67 req/s quota capacity.
+# With 90/5/5 weights, UK South receives 9 req/s (saturates); fallbacks receive
+# 0.5 req/s each (well under their quota). This is the single-region-spill regime
+# that a PTU primary + PAYG fallbacks deployment would encounter under normal load.
+# Combined arrival rate (10 req/s) is under half the combined quota (20 req/s).
+# ---------------------------------------------------------------------------
+
+declare -A CAR_EXPERIMENTS
+# Sanity baseline: equal weights, no saturation. Each backend gets 3.3 req/s ≈ 5 000 TPM.
+CAR_EXPERIMENTS["car_baseline"]="10 5m 33 33 34 10000 0 true 0 1"
+# Single-region spill, no recovery mechanism.
+CAR_EXPERIMENTS["car_90_5_5"]="10 5m 90 5 5 10000 0 false 0 1"
+# CB on 5xx only — should be transparent (no 5xx in quota saturation).
+CAR_EXPERIMENTS["car_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 0 1"
+# APIM retry on spill: retries from UK South 429s should route to WE/SC via acceptRetryAfter.
+CAR_EXPERIMENTS["car_retry_90_5_5"]="10 5m 90 5 5 10000 0 false 3 1"
+# Recommended production stack: 90/5/5 + CB on 5xx only + APIM retry.
+CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 3 1"
+
+# ---------------------------------------------------------------------------
 # Direct experiment definitions
 # Format: "vus iter mode wt_uk wt_we wt_sc"
 # ---------------------------------------------------------------------------
@@ -277,6 +354,7 @@ SUSTAINED="sustained_apim_asym sustained_baseline sustained_apim_retry_cb sustai
 ABLATION="asym_retry_no_cb asym_retry_cb_5xx weight_70_15_15 weight_80_10_10 trip_count_1"
 DIRECT="direct_sequential direct_weighted direct_equal"
 ADAPTIVE="adaptive_burst adaptive_sustained"
+CAR="car_baseline car_90_5_5 car_cb5xx_90_5_5 car_retry_90_5_5 car_retry_cb5xx_90_5_5"
 
 ALL_ORDERED="$PHASE1 $PHASE2A $PHASE2B $PHASE3 $SUSTAINED $ABLATION"
 
@@ -287,7 +365,12 @@ else
 fi
 
 for id in $ORDERED; do
-  if [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
+  if [ -n "${CAR_EXPERIMENTS[$id]+_}" ]; then
+    args="${CAR_EXPERIMENTS[$id]}"
+    read -r rate_per_s duration wuk wwe wsc rpm cb cb429 apim_retry apim_retry_s <<< "$args"
+    run_car_experiment "$id" "$rate_per_s" "$duration" "$wuk" "$wwe" "$wsc" "$rpm" "$cb" \
+      "$cb429" "$apim_retry" "$apim_retry_s"
+  elif [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
     args="${ADAPTIVE_EXPERIMENTS[$id]}"
     read -r vus iter adapt_s penalty epsilon <<< "$args"
     run_adaptive_experiment "$id" "$vus" "$iter" "$adapt_s" "$penalty" "$epsilon"

@@ -36,6 +36,7 @@ single-sentence prompt with `max_tokens: 5`.
 | Quota per backend | 10 000 TPM |
 | Burst load | 20 VUs, 200 iterations |
 | Sustained load | 20 VUs, 5-minute duration |
+| CAR load (Phase 4) | 10 req/s constant arrival rate, 5-minute duration |
 
 ---
 
@@ -359,6 +360,75 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 ¹ Goodput elevated by fast CB-induced 503s; not comparable with real-completion goodput.
 
 ² `direct_sequential` makes up to 3 HTTP calls per iteration (UK→WE→SC fallback chain), giving 567 HTTP calls for 200 k6 iterations. `summarise.py` uses HTTP calls as the denominator (no `original_iterations` counter in `direct_test.js`), reporting 5.8%. Correct per-request rate: 33 ÷ 200 = **16.5%**.
+
+---
+
+## Phase 4: Constant-arrival-rate (open-loop) experiments
+
+### Motivation
+
+Phases 1–3 and the sustained runs all used **closed-loop load** (20 VUs). In a closed-loop test
+each virtual user fires the next request as soon as the previous one completes. A config that
+returns fast 503s (e.g. a tripped circuit breaker) therefore generates far more HTTP calls per
+wall-clock second than a config with slow failures — roughly 163 req/s vs 83 req/s in the
+sustained runs. The two configs are not experiencing the same offered load.
+
+A **constant-arrival-rate** (CAR) executor fires requests at a fixed rate independent of response
+time. Fast failures free VU slots but do not increase the arrival rate. This removes the confound
+and makes sustained comparisons fair.
+
+### Design
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Arrival rate | 10 req/s | ≈ 1.5× one region's 6.67 req/s quota capacity; under half the 20 req/s combined capacity |
+| Duration | 5 minutes | Covers 5 quota reset cycles (PT60S each) |
+| Weights | 90/5/5 | UK South receives 9 req/s (saturates); WE and SC receive 0.5 req/s each (fresh quota) |
+| `preAllocatedVUs` | 30 | Handles up to 30× the per-request latency ceiling before dropping arrivals |
+| Response check | body must contain `choices[]` | Guards against synthetic gateway responses |
+
+The 10 req/s rate puts UK South (90% of traffic = 9 req/s) above its ~6.67 req/s quota ceiling
+while leaving WE and SC well below theirs (~0.5 req/s vs 6.67 cap). This is the
+**single-region-spill regime**: the scenario a real PTU primary + PAYG fallbacks deployment faces
+during normal peak load, as opposed to the global saturation tested in Phases 1–3.
+
+### Experiments
+
+| run_id | weights | CB | APIM retry | purpose |
+|---|---|---|---|---|
+| `car_baseline` | 33/33/34 | none | none | No saturation (3.3 req/s per backend < 6.67 cap) — sanity anchor |
+| `car_90_5_5` | 90/5/5 | none | none | Primary spill, no recovery mechanism |
+| `car_cb5xx_90_5_5` | 90/5/5 | 5xx only | none | CB transparent under quota 429s — expected identical to `car_90_5_5` |
+| `car_retry_90_5_5` | 90/5/5 | none | count=3 | APIM retry routes UK South 429s to WE/SC via `acceptRetryAfter` |
+| `car_retry_cb5xx_90_5_5` | 90/5/5 | 5xx only | count=3 | Recommended production stack under its intended load regime |
+
+### Results
+
+> **Pending** — experiments not yet run. Requires live infra and PIM activation.
+
+<!-- Replace this block with the summarise.py output table after running:
+     bash scripts/run_experiments.sh car_baseline car_90_5_5 car_cb5xx_90_5_5 car_retry_90_5_5 car_retry_cb5xx_90_5_5
+-->
+
+### Hypotheses
+
+- `car_baseline`: ~100% success. No backend saturates; this is the control case.
+- `car_90_5_5`: ~70–77% success. UK South serves requests up to quota (6.67/9 req/s = 74%), the
+  rest receive 429. WE/SC serve their small allocations at ~100%. No recovery mechanism.
+- `car_cb5xx_90_5_5`: identical to `car_90_5_5`. CB on 5xx never fires; the configuration is
+  transparent under quota-only failures.
+- `car_retry_90_5_5`: substantially higher success than `car_90_5_5`. When UK South returns 429,
+  APIM's `acceptRetryAfter` marks it as temporarily unavailable and routes retries to WE/SC, which
+  have ample remaining quota. Unlike the global-saturation case, retries actually find fresh
+  capacity. This is the experiment that validates or falsifies the PRODUCTION_GUIDE retry
+  recommendation.
+- `car_retry_cb5xx_90_5_5`: similar to `car_retry_90_5_5`. Adding CB on 5xx provides a safety net
+  for hard backend failures without interfering with quota routing.
+
+If the hypotheses hold, the key finding will be: **APIM retry is beneficial under single-region
+spill (the intended production use case) but harmful under global saturation (the sandbox
+worst-case)**. That resolves the flag in the PRODUCTION_GUIDE and converts the current
+"unvalidated extrapolation" to a supported recommendation.
 
 ---
 
