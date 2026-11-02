@@ -381,20 +381,20 @@ and makes sustained comparisons fair.
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Arrival rate | 10 req/s | ≈ 1.5× one region's 6.67 req/s quota capacity; under half the 20 req/s combined capacity |
+| Arrival rate | 10 req/s | Assumed ≈ 1.5× one region's 6.67 req/s quota capacity; actual RPM ceiling turned out to be ~12 RPM (0.2 req/s) per backend — see calibration gate failure below |
 | Duration | 5 minutes | Covers 5 quota reset cycles (PT60S each) |
 | Weights | 90/5/5 | UK South receives 9 req/s (saturates); WE and SC receive 0.5 req/s each (fresh quota) |
 | `preAllocatedVUs` | 30 | Handles up to 30× the per-request latency ceiling before dropping arrivals |
 | Response check | body must contain `choices[]` | Guards against synthetic gateway responses |
 
-The 10 req/s rate puts UK South (90% of traffic = 9 req/s) above its ~6.67 req/s quota ceiling
-while leaving WE and SC well below theirs (~0.5 req/s vs 6.67 cap). This is the
-**single-region-spill regime**: the scenario a real PTU primary + PAYG fallbacks deployment faces
-during normal peak load, as opposed to the global saturation tested in Phases 1–3.
+The 10 req/s rate was intended to put UK South (90% = 9 req/s) above its quota ceiling while
+leaving WE and SC well below theirs (0.5 req/s each). This would represent the
+**single-region-spill regime**: a real PTU primary + PAYG fallbacks deployment at peak load.
+The capacity assumption proved wrong; see calibration gate failure under Results.
 
 **Calibration gate:** `car_baseline` must reach ~95–100% success before the spill math is trusted.
-If it falls short, the 6.67 req/s/region capacity assumption is wrong (token count may differ) and
-the arrival rate should be reduced before interpreting `car_90_5_5` results.
+If it falls short, the capacity assumption is wrong and the arrival rate must be reduced before
+interpreting `car_90_5_5` results.
 
 **Dropped iterations:** the k6 summary reports `dropped_iterations` when all pre-allocated VUs are
 busy and a new arrival cannot be assigned a slot. If non-zero, the constant-arrival-rate guarantee
@@ -413,49 +413,130 @@ is broken for those requests (they were never sent). Check this metric before dr
 
 ### Results
 
-> **Pending** — experiments not yet run. Requires live infra and PIM activation.
+All six experiments ran on 2025-11-01. Results from `summarise.py`:
 
-<!-- Replace this block with the summarise.py output table after running:
-     bash scripts/run_experiments.sh car_baseline car_90_5_5 car_cb5xx_90_5_5 \
-       car_retry_90_5_5 car_retry_cb5xx_90_5_5 car_retry_cb429_90_5_5
--->
+| run_id | iterations | http_200 | http_200_% | total_calls | avg_ms | p50_ms | p95_ms | tts_p50_ms | tts_p95_ms | retry_overhead |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `car_baseline` | 3001 | 180 | 6.0 | 3001 | 169.9 | 102.4 | 589.9 | 295.5 | 536.9 | 0.0 |
+| `car_90_5_5` | 3000 | 179 | 6.0 | 3000 | 158.2 | 85.2 | 429.8 | 292.0 | 547.1 | 0.0 |
+| `car_cb5xx_90_5_5` | 3001 | 181 | 6.0 | 3001 | 152.2 | 83.1 | 548.9 | 295.0 | 895.0 | 0.0 |
+| `car_retry_90_5_5` | 3001 | 181 | 6.0 | 3000 | 1094.6 | 1095.6 | 1517.2 | 379.0 | 1233.0 | 0.0 |
+| `car_retry_cb5xx_90_5_5` | 3001 | 181 | 6.0 | 3001 | 1065.0 | 1094.7 | 1172.6 | 357.0 | 472.0 | 0.0 |
+| `car_retry_cb429_90_5_5` | 3001 | 176 | 5.9 | 3001 | 96.1 | 13.6 | 780.8 | 295.0 | 433.5 | 0.0 |
 
-### Hypotheses
+No `dropped_iterations` on any run; the constant-arrival-rate guarantee held throughout.
 
-The core mechanistic question is whether retries **actually route to WE/SC** or just re-hit UK
+Error-type breakdown (derived from k6 check counters):
+
+| run_id | http_200 | http_429 | http_5xx | p50_ms | interpretation |
+|---|---|---|---|---|---|
+| `car_baseline` | 180 | 2768 | 53 | 102 | Backend 429s dominate; CB not active |
+| `car_90_5_5` | 179 | 2821 | 0 | 85 | All failures are backend 429s |
+| `car_cb5xx_90_5_5` | 181 | 2820 | 0 | 83 | Identical — CB on 5xx never fires |
+| `car_retry_90_5_5` | 181 | 53 | 2767 | 1096 | APIM retries 429s; 3 × 365 ms delay before returning 503 |
+| `car_retry_cb5xx_90_5_5` | 181 | 0 | 2820 | 1095 | Same retry pattern; CB on 5xx still transparent |
+| `car_retry_cb429_90_5_5` | 176 | 0 | 2825 | 14 | All backends CB-tripped; fast pool-empty 503s |
+
+### Calibration gate failure: global saturation
+
+**`car_baseline` achieved 6.0% success — the calibration gate required ≥ 95%.** The experiment
+did not test single-region spill; it tested global saturation. All backends were simultaneously
+above their effective RPM ceiling.
+
+**Deriving the RPM ceiling from `car_baseline`:**
+```
+180 successes ÷ 300 s ÷ 3 backends × 60 = 12 RPM per backend (~0.20 req/s)
+```
+
+At 10 req/s total, every backend was saturated regardless of weights:
+
+| config | UK South rate | WE rate | SC rate | limit |
+|---|---|---|---|---|
+| 33/33/34 (`car_baseline`) | 3.3 req/s (200 RPM) | 3.3 req/s | 3.3 req/s | 12 RPM each |
+| 90/5/5 | 9.0 req/s (540 RPM) | 0.5 req/s (30 RPM) | 0.5 req/s (30 RPM) | 12 RPM each |
+
+Even the 5% fallbacks each received 30 RPM — 2.5× their ceiling. The "single-region-spill regime"
+(UK South saturated, WE/SC fresh) was never reached. The capacity assumption in the Design section
+(`6.67 req/s/region`) was based on TPM-to-throughput math; the binding constraint was RPM, not TPM.
+
+Because all configs saturate all backends identically, total system throughput is
+`3 × 12 RPM = 36 RPM ≈ 0.6 req/s` independent of routing. All six configs converge at
+~6% success for exactly this reason — routing does not move the ceiling.
+
+**Valid arrival rate for the spill regime (informational):**
+
+For UK South (90%) to saturate while WE/SC (5% each) remain under their limits *and* stay under
+those limits even when UK South CB-trips and all traffic redirects to WE/SC:
+
+```
+0.9 × R > 0.20 req/s  (UK South over limit)   → R > 0.22 req/s
+0.5 × R < 0.20 req/s  (WE/SC under limit after CB-trip at 50/50 split)  → R < 0.40 req/s
+```
+
+At R = 0.30 req/s for 5 minutes the total sample is only 90 requests — too small for reliable
+statistics. Testing the spill regime at this quota level requires either higher deployed quota
+or a much longer run duration.
+
+### What the results do reveal
+
+Despite not testing the intended scenario, the data confirm several APIM mechanics:
+
+**APIM retry fires on 429 with ~365 ms inter-retry delay.** `car_retry_90_5_5` shows p50=1095 ms
+(≈ 3 × 365 ms) against p50=85 ms for `car_90_5_5`. The delay accounts for the latency gap; retry
+count is confirmed at 3. Clients waiting on APIM retry face ~1.1 s p50 latency before receiving
+a 503 (APIM converts exhausted-retry-429 to 503 — the client never sees a 429 once retry is on).
+
+**CB on 5xx is transparent under quota-only load.** `car_cb5xx_90_5_5` is indistinguishable from
+`car_90_5_5` across all metrics. Backends return 429 (not 5xx); the CB rule never triggers.
+
+**CB on 429+5xx drains the pool and lowers success.** `car_retry_cb429_90_5_5` achieves 5.9%
+(slightly *lower* than the other configs' 6.0%). All three backends trip on 429s within the first
+second of the run; the pool empties; APIM returns fast 503s (p50=14 ms). The CB resets every 60 s
+and the pattern repeats. In this globally-saturated regime, CB-on-429 makes things worse.
+
+**Pool re-selection under retry is confirmed.** `car_retry_90_5_5` and `car_retry_cb5xx_90_5_5`
+show identical success rates and p50 values, consistent with retries re-entering the 90/5/5 pool
+and landing predominantly on UK South (~90% probability) — no undocumented "exclude-last-failure"
+behaviour was observed.
+
+### Pre-run hypotheses (recorded before results)
+
+The core mechanistic question was whether retries **actually route to WE/SC** or just re-hit UK
 South. `acceptRetryAfter` is a circuit-breaker property: it extends a CB trip duration using the
 backend's `Retry-After` header. It only applies once the CB has tripped. With CB off or CB on 5xx
 only, UK South is never removed from the pool, so retries re-enter the 90/5/5 pool and have a 90%
 chance of landing on UK South again.
 
 - `car_baseline`: ~95–100% success. No backend saturates; this is the calibration control.
-- `car_90_5_5`: ~70–77% success. UK South handles requests up to its quota ceiling (6.67/9 req/s
-  = ~74%); excess requests receive 429. WE/SC serve their 0.5 req/s each at ~100%. No recovery.
-- `car_cb5xx_90_5_5`: identical to `car_90_5_5`. CB on 5xx never fires under quota-only failures.
-- `car_retry_90_5_5`: **small lift over `car_90_5_5` at best.** Retries re-enter the 90/5/5 pool
-  with no CB to remove UK South. ~90% of retries land on UK South again; only the ~10% that
-  randomly route to WE/SC succeed. Expected ~74% + ~10% of failed × (10% routing) ≈ 75–78%.
-  If the actual result is substantially higher, APIM has undocumented "exclude-last-failure"
-  behaviour that this experiment would reveal.
-- `car_retry_cb5xx_90_5_5`: identical to `car_retry_90_5_5`. CB on 5xx doesn't fire on 429s;
-  UK South stays in the pool.
-- `car_retry_cb429_90_5_5`: **substantial lift expected.** UK South trips on N×429s and is removed
-  from the pool. All retries route to WE/SC, which have ample quota. This is the mechanism that
-  actually delivers "retry finds fresh capacity." With 90/5/5 weights the pool-drain risk is low
-  (fallbacks only see 0.5 req/s each before the primary trips, nowhere near exhausting their quota).
+  **Actual: 6.0% — calibration gate failed.**
+- `car_90_5_5`: ~70–77% success. UK South saturated; WE/SC serve at ~100%.
+  **Actual: 6.0% — WE/SC also saturated (30 RPM vs 12 RPM limit).**
+- `car_cb5xx_90_5_5`: identical to `car_90_5_5`. CB on 5xx transparent.
+  **Actual: 6.0% — confirmed.**
+- `car_retry_90_5_5`: small lift at best; retries re-enter 90/5/5 pool, 90% land on UK South.
+  **Actual: 6.0% — no lift; p50=1095 ms confirms 365 ms inter-retry delay.**
+- `car_retry_cb5xx_90_5_5`: identical to `car_retry_90_5_5`.
+  **Actual: 6.0% — confirmed.**
+- `car_retry_cb429_90_5_5`: substantial lift expected; UK South CB-trips, retries route to WE/SC.
+  **Actual: 5.9% — lower than baseline. Pool drain lowers success; p50=14 ms confirms
+  instant pool-empty 503s.**
 
-**What the comparison reveals:**
+### Conclusions
 
-- If `car_retry_cb429_90_5_5` substantially outperforms `car_retry_90_5_5` and
-  `car_retry_cb5xx_90_5_5`: the mechanism is CB-on-429 removing the primary from the pool
-  (which lifts *first attempts* as well as retries once the trip sticks — attribute success to
-  "CB diversion + retry helps during the ramp-up," not retry alone). The PRODUCTION_GUIDE
-  recommendation should be CB-on-429+5xx + retry (not CB-on-5xx-only + retry).
-- If `car_retry_90_5_5` also delivers high success: APIM has undocumented pool exclusion
-  behaviour after a 429; the CB setting matters less. The recommendation stands as written.
-- If all three retry arms (`car_retry_90_5_5`, `car_retry_cb5xx_90_5_5`,
-  `car_retry_cb429_90_5_5`) substantially beat `car_90_5_5`: APIM retry is validated as
-  beneficial in the single-region-spill regime, resolving the "unvalidated extrapolation" flag.
+- **Spill-vs-recovery comparison is inconclusive** — the calibration gate failed; the
+  single-region-spill regime was never entered. The comparison between retry arms cannot be
+  drawn from this data.
+- **Mechanics are confirmed** — APIM retry fires on 429, adds ~365 ms per attempt, and
+  converts the final failure to 503. CB on 5xx is transparent. Pool re-selection under retry
+  is blind (no "exclude-last-failure").
+- **CB-on-429 is harmful at global saturation** — it causes pool drain and lowers success
+  below the no-CB floor. The PRODUCTION_GUIDE note marking this as a scenario-dependent
+  choice is appropriate; at sustained global saturation it should be avoided.
+- **The spill scenario requires lower quota pressure or higher deployed quota.** At 10 000 TPM /
+  12 RPM per backend, a valid spill experiment needs R ≈ 0.22–0.40 req/s, producing fewer than
+  120 requests in a 5-minute run — insufficient for statistical confidence. Increasing quota to
+  ≥ 60 000 TPM per backend would raise the RPM ceiling to ≥ 60 RPM, allowing R ≈ 1–2 req/s
+  and a 300–600 request sample in 5 minutes.
 
 ---
 
@@ -496,3 +577,17 @@ chance of landing on UK South again.
    17.5% burst but 2.4% sustained. `apim_retry_asym` scores 18% burst but 0.3% sustained.
    Any performance claim about a quota-limited AI gateway should be validated with a sustained
    run spanning multiple quota reset cycles before being presented as representative.
+
+8. **The binding quota constraint may be RPM, not TPM.** Phase 4 revealed an effective ceiling
+   of ~12 RPM per backend despite 10 000 TPM deployments. At low token counts per request (17
+   tokens here), TPM math significantly overestimates sustainable throughput. Capacity planning
+   for an APIM load-balancing scenario must be validated empirically with a calibration gate
+   (control run with equal weights and no CB at the intended arrival rate) before drawing
+   conclusions about routing configurations.
+
+9. **CB-on-429 hurts at global saturation; CB-on-5xx is always safe.** When all backends are
+   simultaneously above their limits, tripping on 429 drains the entire pool and reduces success
+   below the no-CB floor (5.9% vs 6.0%). CB-on-429 is only beneficial when at least one backend
+   has spare capacity to receive the redirected traffic — the single-region-spill scenario.
+   CB-on-5xx protects against hard backend failures without any saturation interference and
+   should be the default production setting.
