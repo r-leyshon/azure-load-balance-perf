@@ -337,6 +337,12 @@ EXPERIMENTS["apim_retry_equal_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
 EXPERIMENTS["asym_retry_no_cb_r2"]="20 200 90 5 5 10000 0 true 3 1 none 3 500"
 EXPERIMENTS["optimal_equal_apim_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
 
+# Like-for-like sustained at 60K TPM with APIM retry — companion to sustained_baseline_r2 /
+# sustained_cb_only_r2. Resolves the open question of whether retry degrades sustained
+# goodput at the same quota level. QUOTA: 60 000 TPM.
+EXPERIMENTS["sustained_apim_retry_60k"]="20 5m 33 33 34 10000 0 true 3 1 none 3 500"
+EXPERIMENTS["sustained_apim_asym_60k"]="20 5m 90 5 5 10000 3 true 3 1 none 3 500"
+
 # ---------------------------------------------------------------------------
 # Phase 4 — constant-arrival-rate (CAR) experiment definitions
 # Format: "rate_per_s duration wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s"
@@ -366,14 +372,11 @@ CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="2 5m 90 5 5 10000 3 false 3 1"
 CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="2 5m 90 5 5 10000 3 true 3 1"
 
 # Optional: spill with CB trip count=1 — does faster UK South removal change recovery vs trip=3?
-# Uncomment to run at 60K TPM.
-# CAR_EXPERIMENTS["car_retry_cb429_90_5_5_trip1"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["car_retry_cb429_90_5_5_trip1"]="2 5m 90 5 5 10000 1 true 3 1"
 
-# Optional: sustained baseline and CB-only runs at 60K with APIM retry enabled — needed for
-# a like-for-like sustained comparison with sustained_baseline_r2 and sustained_cb_only_r2.
-# Add to SUSTAINED_EXPERIMENTS when defined.
-# SUSTAINED_EXPERIMENTS["sustained_apim_retry_60k"]="20 5m 33 33 34 0 false 3 1"
-# SUSTAINED_EXPERIMENTS["sustained_apim_asym_60k"]="20 5m 90 5 5 10000 3 true 3 1"
+# Like-for-like sustained runs at 60K TPM with APIM retry enabled — needed to compare with
+# sustained_baseline_r2 and sustained_cb_only_r2 (also 60K). QUOTA: 60 000 TPM.
+# Format matches EXPERIMENTS: vus dur wuk wwe wsc rpm cb cb429 apim_retry apim_retry_s strategy max_r delay
 
 # A3 repeats — ×3 runs for the three most informative spill arms.
 CAR_EXPERIMENTS["car_90_5_5_r2"]="2 5m 90 5 5 10000 0 false 0 1"

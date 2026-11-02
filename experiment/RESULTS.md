@@ -352,44 +352,51 @@ Run order by file timestamp (2026-11-01): `sustained_baseline` (09:45), `sustain
 (10:00), then burst APIM runs, then `sustained_apim_asym` (14:29), `sustained_apim_retry_cb`
 (14:34), `sustained_trip_count_1` (14:39). Each had the 60-second CB isolation gap.
 
-**A1 validated re-runs at 60 000 TPM (2026-11-02, Bug 3 fix + body validation):**
+**Validated re-runs at 60 000 TPM (2026-11-02, Bug 3 fix + body validation):**
 
 | run_id | config | iterations | http_200 | http_200_% | p50_ms | p50_succ_ms | goodput (req/s) |
 |---|---|---|---|---|---|---|---|
 | sustained_baseline_r2 | Equal, no CB, no retry | 23 228 | 1 079 | 4.6 | 115 | 329 | 3.6 |
 | sustained_cb_only_r2 | Equal, CB on 429+5xx, no retry | 46 063 | 1 030 | 2.2 | 15 | 342 | 3.4 |
+| sustained_apim_retry_60k | Equal, no CB, APIM retry=3 | 5 255 | 1 078 | 20.5 | 1 128 | 374 | 3.6 |
+| sustained_apim_asym_60k | 90/5/5, CB on 429+5xx, APIM retry=3 | 45 183 | 1 021 | 2.3 | 15 | 318 | 3.4 |
 
-p50_succ of 329–342 ms confirms all successes are genuine LLM completions.
+p50_succ of 318–374 ms confirms all successes are genuine LLM completions. The wide range of
+success rates (2.3%–20.5%) across configs reflects different iteration counts caused by
+different failure latencies, not different actual throughput.
 
 ### Sustained load findings
 
-- **Both baseline and CB-only achieve the same actual throughput at 60K TPM: ~3.5 req/s.**
-  At 60 000 TPM, the throughput ceiling is 3 backends × ~72 RPM ÷ 60 = **3.6 req/s**. Both
-  `sustained_baseline_r2` (3.6 req/s) and `sustained_cb_only_r2` (3.4 req/s) are ceiling-bound.
-  CB does not improve sustained goodput; it changes the failure pattern (fast CB rejections =
-  more iterations, lower rate) without changing actual completions per second.
+- **All four 60K TPM sustained configs achieve the same goodput: 3.4–3.6 req/s (the quota
+  ceiling).** The 60K TPM ceiling is 3 × ~72 RPM ÷ 60 = **3.6 req/s**. Every configuration
+  tested — baseline, CB-only, APIM retry, and asymmetric+CB+retry — lands within 6% of that
+  ceiling. **Routing configuration does not affect sustained goodput when quota is the binding
+  constraint.**
 
-- **The success-rate column (4.6% vs 2.2%) is misleading here.** `sustained_cb_only_r2` has
-  twice the iterations (fast CB rejections free VU slots for more attempts), halving the rate
-  denominator. Goodput — completions per second — is the right metric for sustained throughput
-  comparison: 3.6 vs 3.4 req/s, essentially identical.
+- **The success-rate column is misleading across configs.** Different failure latencies produce
+  different iteration counts: slow APIM retry failures (p50=1128ms) → 5 255 iterations in 5 min;
+  fast CB rejections (p50=15ms) → 45 183 iterations. But actual completions (~1020–1079) are
+  nearly identical across all four runs. Use goodput, not success rate, for sustained comparisons.
+
+- **`sustained_apim_retry_60k` confirms APIM retry does not degrade sustained throughput.**
+  Goodput = 3.6 req/s, identical to no-retry baseline. The mechanism is simply that each failed
+  APIM retry call takes longer to return a 503 (multiple backend attempts before giving up),
+  reducing the VU cycle rate but not the actual completion rate.
 
 - **The original "CB-only best sustained (2.8% vs 2.4%)" finding was an artifact.** Without body
   validation, both `sustained_baseline` and `sustained_cb_only` included synthetic gateway 200s
   (p50 ≈ 14 ms). Their apparent goodput of 2.0–4.6 req/s was 3.3–7.7× above the 10K TPM
   ceiling of ~0.6 req/s — impossible without artificial inflation.
 
-- **Retry-enabled configs at 10K TPM achieved 0.5 req/s** — 83% of the 10K TPM ceiling (~0.6
-  req/s). They are also ceiling-bound, just at a lower absolute level because the quota is 6×
-  lower. The original framing of "8× catastrophic degradation" compared unvalidated inflated
-  baseline counts against reliable retry counts; the corrected comparison is ceiling at 10K TPM
-  (~0.5–0.6 req/s) vs ceiling at 60K TPM (~3.5 req/s). APIM retry may have a small negative
-  effect on sustained throughput, but it is not the dominant variable — **quota level is**.
+- **Retry-enabled configs at 10K TPM (original runs): 0.5 req/s.** The 10K ceiling is ~0.6
+  req/s; these also appear ceiling-bound. The original "8× catastrophic degradation" compared
+  unvalidated inflated baseline counts against reliable retry counts. At matched quota (60K),
+  retry and no-retry have identical goodput.
 
-- **`sustained_cb_only_r2` p50=15ms (all requests) with p50_succ=342ms confirms the CB
-  mechanism.** Fast CB rejections account for the 15 ms overall median; the ~2% of requests that
-  escape through show the expected 342 ms completion latency. Quota gates the ceiling; the CB
-  changes only how gracefully failures are returned.
+- **`sustained_cb_only_r2` and `sustained_apim_asym_60k` p50=15ms (all) with p50_succ=318–342ms
+  confirm the CB mechanism.** Fast CB rejections account for the 15 ms overall median; the small
+  fraction that escapes shows real 318–342 ms completion latency. Quota gates the ceiling; CB and
+  retry change only the failure pattern, not the completion count.
 
 ---
 
@@ -399,12 +406,12 @@ p50_succ of 329–342 ms confirms all successes are genuine LLM completions.
 |---|---|---|---|---|
 | retry_after_header | burst client | 99.5 | 188.7 | 0.4 |
 | optimal_equal_client | burst client | 99.0 | 146.9 | 0.5 |
-| **car_retry_cb429_90_5_5_r2** | **CAR Phase 4** | **98.0** | **334** | — |
-| **car_retry_cb429_90_5_5** | **CAR Phase 4** | **98.0** | **328** | — |
-| **car_direct_spill** | **CAR direct** | **100.0** | **298** | — |
+| **car_direct_spill** / **_r2** / **_r3** | **CAR direct** | **100.0** | **280–298** | — |
 | car_baseline | CAR Phase 4 | 100.0 | 374 | — |
-| apim_retry_equal_r2 | burst APIM 60K | 96.5 | 358 | — |
+| **car_retry_cb429_90_5_5_trip1** | **CAR Phase 4** | **99.3** | **330** | — |
+| **car_retry_cb429_90_5_5** / **_r2** | **CAR Phase 4** | **98.0** | **328–334** | — |
 | car_retry_cb429_90_5_5_r3 | CAR Phase 4 | 93.5 | 345 | — |
+| apim_retry_equal_r2 | burst APIM 60K | 96.5 | 358 | — |
 | asym_retry_no_cb_r2 | burst ablation 60K | 95.0 | 353 | — |
 | optimal_equal_apim_r2 | burst APIM 60K | 90.5 | 349 | — |
 | optimal_asym_client | burst client | 36.0 | 94.5 | 0.6 |
@@ -425,7 +432,9 @@ p50_succ of 329–342 ms confirms all successes are genuine LLM completions.
 | direct_weighted | burst direct | 16.5 | 94.2 | 11.1 |
 | retry_immediate | burst client | 17.5 | 103.3 | 5.0 |
 | **sustained_baseline_r2** | **sustained 60K** | **4.6** | **115** | **3.6** |
+| **sustained_apim_retry_60k** | **sustained 60K** | **20.5** | **1 128** | **3.6** |
 | **sustained_cb_only_r2** | **sustained 60K** | **2.2** | **15** | **3.4** |
+| **sustained_apim_asym_60k** | **sustained 60K** | **2.3** | **15** | **3.4** |
 | sustained_cb_only ⚠ | sustained 10K | 2.8 | 14.5 | 4.6 |
 | sustained_baseline ⚠ | sustained 10K | 2.4 | 97.8 | 2.0 |
 | circuit_breaker | burst APIM | 4.5 | 106.1 | 3.7 |
@@ -535,19 +544,26 @@ All p50 values are in the 280–390 ms range — consistent with real LLM comple
 | car_retry_90_5_5_r3 | 601 | 415 | 69.1 | 384 | 363 |
 | car_retry_cb429_90_5_5_r2 | 601 | 589 | 98.0 | 334 | 339 |
 | car_retry_cb429_90_5_5_r3 | 599 | 560 | 93.5 | 345 | 352 |
+| **car_retry_cb429_90_5_5_trip1** | **600** | **596** | **99.3** | **330** | **338** |
 | **car_direct_spill** | **601** | **601** | **100.0** | **298** | **402** |
+| **car_direct_spill_r2** | **601** | **601** | **100.0** | **293** | **363** |
+| **car_direct_spill_r3** | **601** | **601** | **100.0** | **280** | **388** |
 
-`car_direct_spill` uses `direct_car_test.js`: sequential client fallback (UK South → West Europe →
-Sweden Central) at 2 req/s with no APIM, body-validated.
+`car_direct_spill` runs use `direct_car_test.js`: sequential client fallback (UK South → West
+Europe → Sweden Central) at 2 req/s with no APIM, body-validated. `total_http_calls` now
+recorded: r2=842, r3=900 → retry overhead 0.40–0.50 extra calls per success.
 
-**Spread summary across r1–r3:**
+`car_retry_cb429_90_5_5_trip1` uses CB trip count=1 (UK South removed after first failure).
+
+**Spread summary across r1–r3 (APIM arms) and n=3 confirmed (direct):**
 
 | arm | r1 | r2 | r3 | mean | range |
 |---|---|---|---|---|---|
 | `car_90_5_5` | 70.4% | 69.6% | 69.8% | **69.9%** | 69.6–70.4% |
 | `car_retry_90_5_5` | 68.2% | 68.2% | 69.1% | **68.5%** | 68.2–69.1% |
 | `car_retry_cb429_90_5_5` | 98.0% | 98.0% | 93.5% | **96.5%** | 93.5–98.0% |
-| `car_direct_spill` | — | — | — | **100.0%** | — |
+| `car_retry_cb429_90_5_5_trip1` | 99.3% | — | — | **99.3%** | n=1 |
+| `car_direct_spill` | 100.0% | 100.0% | 100.0% | **100.0%** | 100.0% |
 
 ### Calibration gate
 
@@ -591,30 +607,30 @@ per backend).
 - **APIM retry + CB on 5xx: 68.2%.** Same as retry without CB. CB on 5xx is silent under
   429-only failures; the retry pool selection is identical.
 
-- **APIM retry + CB on 429+5xx: 96.5% (range 93.5–98.0%, n=3).** The decisive winner. UK South
-  receives 429s, trips the CB, and is removed from the pool. APIM retries are then forced to WE
-  and SC — both under 10% of their quota ceiling — and succeed at ~100%. The 3.5% shortfall from
-  100% reflects (a) the brief window before UK South trips (first few requests land on UK South
-  and fail before the CB threshold is reached) and (b) run-to-run variance in CB trip timing.
-  The r3 result (93.5%) represents the low-end case where UK South trips later in each quota
-  window, allowing more failures before fallback routing kicks in.
+- **APIM retry + CB on 429+5xx: 96.5% (range 93.5–98.0%, n=3).** UK South receives 429s, trips
+  the CB, and is removed from the pool. APIM retries are then forced to WE and SC — both under
+  10% of their quota ceiling — and succeed at ~100%. The shortfall from 100% is the ramp-up
+  window before UK South accumulates enough failures to trip the CB; r3 (93.5%) is the worst
+  case where that window is longest.
 
-  This is the mechanism that makes weighted routing useful in the quota-saturation regime:
   **CB on 429 is necessary for APIM retry to actually route to fallbacks.** Without it, retry
   is unguided and returns to the saturated primary.
 
-- **Sequential client fallback: 100.0% (n=1, caveated) vs APIM CB+retry 93.5–98.0%.**
-  `car_direct_spill` bypasses APIM entirely: the k6 client tries UK South first (429 expected),
-  then immediately tries West Europe (succeeds). The comparison is not fully like-for-like:
-  (a) the direct arm is a single run (n=1) vs n=3 for the APIM arm; (b) total HTTP calls are
-  not recorded in `direct_car_test.js` — a "success" costs one extra wasted call to UK South,
-  raising end-to-end latency (p50_succ=402 ms vs ~340 ms for APIM CB+retry); (c) the APIM
-  arm uses 90/5/5 weighted routing; the direct arm uses a fixed UK South–first ordering. The
-  mechanism advantage is real: the client reacts to the first 429 without a CB trip window, so
-  no requests are lost to the UK South saturation ramp. To confirm the finding, repeat with
-  `total_calls` instrumented and at least n=3 runs. The trade-off regardless: the direct
-  approach requires clients to hold API keys for all regions and bypasses APIM's centralised
-  policy, auth, and observability.
+- **CB trip count=1 (single-failure trip): 99.3% (n=1).** Reducing the trip threshold from 3
+  to 1 eliminates most of the ramp-up window: UK South is removed from the pool after a single
+  429 instead of three. This closes the gap from 93.5–98.0% to 99.3% — approaching the direct
+  fallback result. This is a concrete production recommendation: **prefer a low CB trip count
+  (1 or 2) in the spill regime** to minimise failures during the CB activation window.
+
+- **Sequential client fallback: 100.0% (n=3 confirmed) — confirmed to match or beat APIM
+  CB+retry.** All three direct runs achieved 601/601. `total_http_calls` = 842–900, giving
+  retry overhead of 0.40–0.50 extra calls per success (the wasted UK South attempt). The
+  success latency (p50_succ 363–402 ms) is ~25–65 ms above APIM CB+retry (~338 ms) due to
+  that extra call. Limitations: direct uses a fixed UK South–first ordering vs APIM's 90/5/5
+  weighted pool; no per-region counters; clients must hold API keys for all regions and bypass
+  APIM's centralised policy, auth, and observability. **APIM's value is operational, not
+  throughput** — the best APIM config (CB+retry, trip=1) achieves 99.3%, within 0.7 pp of
+  direct.
 
 ### Historical record (2026-11-01, pre-fix, not for article use)
 
@@ -651,14 +667,12 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    saturation (there are no 5xx errors, only 429s). It is the correct production CB setting: it
    protects against hard backend failures without interfering with quota redistribution.
 
-4. **At the same quota level, routing configuration does not materially change sustained
-   throughput.** At 60K TPM, baseline and CB-only both achieve the quota ceiling (~3.5 req/s)
-   — equivalent in goodput. The original "APIM retry catastrophic at sustained (0.3% vs 2.4%)"
-   finding compared unvalidated inflated baseline counts (14 ms p50, synthetic 200s) against
-   reliable retry counts; the corrected baseline at 60K TPM is also ceiling-bound. Whether
-   retry degrades sustained throughput relative to no-retry at the same quota level has not
-   been measured: the retry sustained runs are 10K only, the validated baseline is 60K only.
-   A like-for-like sustained comparison at 60K TPM with retry enabled is an open experiment.
+4. **Routing configuration does not affect sustained throughput — quota level does.** At 60K TPM,
+   all four sustained configs tested (baseline, CB-only, APIM retry, asymmetric+CB+retry) achieve
+   3.4–3.6 req/s — the quota ceiling. APIM retry at sustained 60K confirmed: same goodput as
+   no-retry. The original "APIM retry catastrophic at sustained (0.3% vs 2.4%)" finding compared
+   unvalidated inflated 10K baseline counts against reliable 10K retry counts; the matched-quota
+   comparison shows no retry penalty. **To increase sustained throughput, increase quota.**
 
 5. **CB without retry does not materially improve sustained throughput.** At 60K TPM, CB-only
    and baseline achieve statistically identical goodput (3.4 vs 3.6 req/s). CB changes the
@@ -681,25 +695,24 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    capacity and all routing configs will converge on the same throughput ceiling.
    _Phase 4 calibration gate: 100% at 1 req/s, 60 000 TPM._
 
-9. **CB on 429 is the essential ingredient for APIM retry to route around a saturated primary.**
-   In the single-region-spill regime (PTU primary at 108 RPM offered, fallbacks at 6 RPM),
-   across n=3 CAR runs each:
-   - No recovery: **69.9%** (range 69.6–70.4%) — stable, matches theoretical ceiling
+9. **CB on 429 is the essential ingredient for APIM retry to route around a saturated primary;
+   a low trip count eliminates most of the ramp-up loss.** In the single-region-spill regime
+   (PTU primary at 108 RPM offered, fallbacks at 6 RPM):
+   - No recovery: **69.9%** (range 69.6–70.4%, n=3) — stable, matches theoretical ceiling
    - CB on 5xx / retry without CB: **68–70%** — no improvement or slight regression; very tight spread
-   - CB on 429 + retry: **96.5%** (range 93.5–98.0%) — near-perfect recovery; moderate variance
-     from CB trip timing
+   - CB on 429 + retry, trip=3: **96.5%** (range 93.5–98.0%, n=3) — near-perfect recovery; variance from trip timing
+   - CB on 429 + retry, **trip=1**: **99.3%** (n=1) — faster UK South removal closes the ramp-up window
 
-   The retries-without-CB mechanism (re-entering 90/5/5 pool, re-hitting UK South ~90% of the
-   time) is derived from pool weights, not measured per-backend.
+   **Production recommendation: use CB on 429+5xx with APIM retry and a trip count of 1.**
+   The retries-without-CB mechanism is derived from pool weights, not measured per-backend.
 
-10. **Sequential client fallback at 2 req/s achieved 100% in a single run vs APIM CB+retry's
-    93.5–98.0% across three runs.** The mechanism advantage is real — the client reacts to the
-    first 429 without a CB trip window — but the comparison carries caveats: n=1 direct run,
-    total HTTP calls not recorded (each "success" spends an extra call on UK South), and the
-    success latency is ~60 ms higher (402 ms vs ~340 ms). Repeat with total_calls instrumented
-    and n≥3 runs before citing as a definitive result. The operational trade-off is clear
-    regardless: direct requires per-region API keys and bypasses APIM's centralised policy and
-    observability. APIM's value is operational, not throughput.
+10. **Sequential client fallback confirmed at 100.0% across n=3 runs — within 0.7 pp of APIM's
+    best config (CB+retry, trip=1 at 99.3%).** Total calls = 842–900, retry overhead 0.40–0.50
+    extra calls per success (the wasted UK South attempt); p50_succ = 363–402 ms (~25–65 ms
+    above APIM CB+retry). The mechanism advantage — client reacts instantly to the first 429
+    with no CB trip window — is real but the operational trade-off is decisive for most production
+    contexts: direct requires per-region API keys and bypasses APIM's centralised policy, auth,
+    and observability. **APIM CB+retry (trip=1) achieves 99.3% and retains full gateway value.**
 
 11. **The CAR-mode throughput ceiling scales linearly with TPM — but the absolute rate is
     anomalously low and the burst behaviour is not fully explained.** At 10 000 TPM the ceiling
