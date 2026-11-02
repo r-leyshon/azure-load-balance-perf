@@ -38,10 +38,11 @@ resource "azapi_update_resource" "circuit_breaker" {
   resource_id = azurerm_api_management_backend.foundry[each.key].id
 
   # azapi 2.x requires a native HCL object, not jsonencode()
+  # circuitBreaker = null clears any existing CB config; Azure rejects rules = [].
   body = {
     properties = {
-      circuitBreaker = {
-        rules = var.circuit_breaker_failure_count > 0 ? [
+      circuitBreaker = var.circuit_breaker_failure_count > 0 ? {
+        rules = [
           {
             name             = "trip-on-overload"
             tripDuration     = "PT60S"
@@ -55,8 +56,8 @@ resource "azapi_update_resource" "circuit_breaker" {
               )
             }
           }
-        ] : []
-      }
+        ]
+      } : null
     }
   }
 }

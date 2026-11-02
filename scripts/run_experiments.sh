@@ -296,27 +296,29 @@ EXPERIMENTS["trip_count_1"]="20 200 90 5 5 10000 1 true 3 1 none 3 500"       # 
 # Phase 4 — constant-arrival-rate (CAR) experiment definitions
 # Format: "rate_per_s duration wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s"
 #
-# Rate: 10 req/s ≈ 1.5× one region's 6.67 req/s quota capacity.
-# With 90/5/5 weights, UK South receives 9 req/s (saturates); fallbacks receive
-# 0.5 req/s each (well under their quota). This is the single-region-spill regime
-# that a PTU primary + PAYG fallbacks deployment would encounter under normal load.
-# Combined arrival rate (10 req/s) is under half the combined quota (20 req/s).
+# Quota: 60 000 TPM per backend → CAR ceiling ≈ 72 RPM (1.2 req/s) per backend
+# (scaled from the 10 000 TPM observation of ~12 RPM/backend).
+#
+# Calibration (car_baseline): 1 req/s, equal weights → ~20 RPM/backend (28% utilisation).
+# Spill experiments: 2 req/s, 90/5/5 → UK South receives 1.8 req/s = 108 RPM
+# (saturates), WE/SC receive 0.1 req/s = 6 RPM (well under ceiling).
+# This is the single-region-spill regime: PTU primary saturated, PAYG fallbacks idle.
 # ---------------------------------------------------------------------------
 
 declare -A CAR_EXPERIMENTS
-# Sanity baseline: equal weights, no saturation. Each backend gets 3.3 req/s ≈ 5 000 TPM.
-CAR_EXPERIMENTS["car_baseline"]="10 5m 33 33 34 10000 0 true 0 1"
+# Calibration gate: equal weights, well under quota ceiling. Must achieve ≥95% success.
+CAR_EXPERIMENTS["car_baseline"]="1 5m 33 33 34 10000 0 true 0 1"
 # Single-region spill, no recovery mechanism.
-CAR_EXPERIMENTS["car_90_5_5"]="10 5m 90 5 5 10000 0 false 0 1"
+CAR_EXPERIMENTS["car_90_5_5"]="2 5m 90 5 5 10000 0 false 0 1"
 # CB on 5xx only — should be transparent (no 5xx in quota saturation).
-CAR_EXPERIMENTS["car_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 0 1"
+CAR_EXPERIMENTS["car_cb5xx_90_5_5"]="2 5m 90 5 5 10000 3 false 0 1"
 # APIM retry on spill, unguided: retries re-enter 90/5/5 pool (no CB to remove UK South).
-CAR_EXPERIMENTS["car_retry_90_5_5"]="10 5m 90 5 5 10000 0 false 3 1"
+CAR_EXPERIMENTS["car_retry_90_5_5"]="2 5m 90 5 5 10000 0 false 3 1"
 # Recommended production stack: 90/5/5 + CB on 5xx only + APIM retry.
-CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="10 5m 90 5 5 10000 3 false 3 1"
+CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="2 5m 90 5 5 10000 3 false 3 1"
 # CB on 429+5xx + retry: UK South trips on 429s and is removed from the pool, so retries
 # are forced to WE/SC. Tests whether routing to fallbacks requires CB-on-429.
-CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="10 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="2 5m 90 5 5 10000 3 true 3 1"
 
 # ---------------------------------------------------------------------------
 # Direct experiment definitions
