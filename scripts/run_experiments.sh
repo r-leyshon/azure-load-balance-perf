@@ -326,11 +326,13 @@ EXPERIMENTS["weight_80_10_10"]="20 200 80 10 10 10000 3 true 3 1 none 3 500"  # 
 EXPERIMENTS["trip_count_1"]="20 200 90 5 5 10000 1 true 3 1 none 3 500"       # CB trips on 1st failure
 
 # A1 re-runs — sustained_baseline and sustained_cb_only now have body check in load_test.js
+# QUOTA: 60 000 TPM (terraform.tfvars updated before these ran, 2026-11-02)
 EXPERIMENTS["sustained_baseline_r2"]="20 5m 33 33 34 10000 0 true 0 1 none 3 500"
 EXPERIMENTS["sustained_cb_only_r2"]="20 5m 33 33 34 10000 3 true 0 1 none 3 500"
 
 # A2 re-runs — apim_retry_equal / asym_retry_no_cb / optimal_equal_apim may have carried
 # stale CB rules; re-run after Bug 3 fix ensures clean state via circuitBreaker = null
+# QUOTA: 60 000 TPM (terraform.tfvars updated before these ran, 2026-11-02)
 EXPERIMENTS["apim_retry_equal_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
 EXPERIMENTS["asym_retry_no_cb_r2"]="20 200 90 5 5 10000 0 true 3 1 none 3 500"
 EXPERIMENTS["optimal_equal_apim_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
@@ -363,6 +365,16 @@ CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="2 5m 90 5 5 10000 3 false 3 1"
 # are forced to WE/SC. Tests whether routing to fallbacks requires CB-on-429.
 CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="2 5m 90 5 5 10000 3 true 3 1"
 
+# Optional: spill with CB trip count=1 — does faster UK South removal change recovery vs trip=3?
+# Uncomment to run at 60K TPM.
+# CAR_EXPERIMENTS["car_retry_cb429_90_5_5_trip1"]="2 5m 90 5 5 10000 1 true 3 1"
+
+# Optional: sustained baseline and CB-only runs at 60K with APIM retry enabled — needed for
+# a like-for-like sustained comparison with sustained_baseline_r2 and sustained_cb_only_r2.
+# Add to SUSTAINED_EXPERIMENTS when defined.
+# SUSTAINED_EXPERIMENTS["sustained_apim_retry_60k"]="20 5m 33 33 34 0 false 3 1"
+# SUSTAINED_EXPERIMENTS["sustained_apim_asym_60k"]="20 5m 90 5 5 10000 3 true 3 1"
+
 # A3 repeats — ×3 runs for the three most informative spill arms.
 CAR_EXPERIMENTS["car_90_5_5_r2"]="2 5m 90 5 5 10000 0 false 0 1"
 CAR_EXPERIMENTS["car_90_5_5_r3"]="2 5m 90 5 5 10000 0 false 0 1"
@@ -381,7 +393,11 @@ declare -A DIRECT_CAR_EXPERIMENTS
 # A4: no-gateway comparison at the same rate as the spill arms. UK South receives all
 # first attempts (saturates); overflow falls back to WE then SC. Compare with
 # car_retry_cb429_90_5_5 (98%) to quantify the APIM gateway value at this load.
+# Note: total_http_calls is now instrumented; each success costs one extra UK South call.
 DIRECT_CAR_EXPERIMENTS["car_direct_spill"]="2 5m"
+# A4 repeats (r2, r3): confirm 100% result is stable and record total_http_calls spread.
+DIRECT_CAR_EXPERIMENTS["car_direct_spill_r2"]="2 5m"
+DIRECT_CAR_EXPERIMENTS["car_direct_spill_r3"]="2 5m"
 
 # ---------------------------------------------------------------------------
 # Direct experiment definitions

@@ -2,8 +2,9 @@
 
 Experiments characterise the behaviour of Azure API Management (APIM) as an AI gateway in front
 of three Azure AI Foundry deployments (UK South, West Europe, Sweden Central), under deliberate
-quota saturation. All runs used `gpt-4.1-mini` with 10 000 TPM per region — chosen specifically
-to be exhaustible within seconds, making failure modes visible.
+quota saturation. Phases 1–3 and sustained original runs used `gpt-4.1-mini` with **10 000 TPM**
+per region — chosen specifically to be exhaustible within seconds, making failure modes visible.
+Phase 4 CAR runs and A1/A2 re-runs used **60 000 TPM** per region.
 
 Load was generated locally with [Grafana k6](https://k6.io). Each request sends a fixed
 single-sentence prompt with `max_tokens: 5`.
@@ -128,10 +129,12 @@ The correct per-request success rate is 33 ÷ 200 = **16.5%**, in line with `dir
   here, not a pool drainer, because the fallbacks have substantial remaining quota when UK South
   trips.
 
-- **The CB trigger matters less than the weight distribution.** CB on 429+5xx with equal weights
-  (4.5%) is the dangerous case because all backends drain simultaneously. CB on 429+5xx with
-  asymmetric weights (16.5%) is effectively neutral because the primary drains first and the
-  fallbacks are spared. CB on 5xx only (16.5%) is always neutral.
+- **For no-retry configurations, weight distribution modulates CB impact.** CB on 429+5xx with
+  equal weights (4.5%) is the dangerous case because all backends drain simultaneously. CB on
+  429+5xx with asymmetric weights (16.5%) is effectively neutral because the primary drains first
+  and the fallbacks are spared. CB on 5xx only (16.5%) is always neutral. When APIM retry is
+  enabled (Phase 2b/ablation), weight distribution becomes secondary — the presence or absence of
+  CB on 429 determines outcome far more than the weight split.
 
 - **`full_resilience` (500 RPM gateway cap): 0 successes.** The gateway throttle rejects all
   requests before they reach any backend. This is an APIM gateway-level constraint, not a
@@ -175,7 +178,8 @@ Client retries on 429 up to 3 attempts. Base config: equal weights, no CB, no AP
 
 ## Phase 2b — APIM server-side retry
 
-APIM retries the backend pool up to 3× on 429. Each retry can route to a different pool member.
+APIM retries the backend pool up to 3× on 429. Without CB, each retry re-enters the same
+weighted pool — it can select any member, including the one that just returned 429.
 Client retry disabled for isolation. Original runs at 10 000 TPM.
 
 | run_id | config | http_200_% | p50_ms | tts_p50_ms | goodput (req/s) |
@@ -193,9 +197,12 @@ suggesting contamination was absent or had minimal impact on this run.
 |---|---|---|---|---|---|---|
 | apim_retry_equal_r2 | Equal weights, no CB, APIM retry=3 | 200 | 193 | **96.5** | 358 | 365 |
 
-At 60 000 TPM the 200-iteration burst consumes only ~8% of the per-backend quota window; retries
-find fresh capacity and succeed. This confirms APIM retry without CB is highly effective when
-backends have ample quota headroom. The key variable is quota saturation level, not CB state.
+At 60 000 TPM the 200-iteration burst achieves 96.5%. The exact quota mechanism that permits this
+is not fully characterised: the measured CAR ceiling of ~72 RPM would, if applied directly to the
+burst rate, predict fewer successes — suggesting the RPM limit operates differently under short
+burst conditions than under sustained CAR load (see open question in TK11). Empirically, APIM
+retry without CB is highly effective when backends have quota available. The key variable is quota
+saturation level, not CB state.
 
 ### Phase 2b findings
 
@@ -220,9 +227,11 @@ backends have ample quota headroom. The key variable is quota saturation level, 
   even with APIM retries routing to them, they have sufficient quota to serve ~18% of 200
   iterations.
 
-- **The weight distribution, not the CB trigger alone, determines burst outcome at 10K TPM.**
-  With asymmetric weights, CB on 429+5xx is harmless at burst because the fallbacks are never
-  close to exhaustion. With equal weights, CB on 429+5xx is harmful regardless of retry.
+- **At 10K TPM with APIM retry, CB state is the key variable — weight distribution is
+  secondary.** With CB off: equal weights (18.5%) ≈ 90/5/5 (18.0%) — weights are
+  indistinguishable. With CB on 429+5xx: equal weights (4.5%) is disastrous, asymmetric
+  (18.0%) is not — here weights modulate CB's impact, but only because CB is the active
+  mechanism. Turning CB off removes the sensitivity to weights entirely.
 
 ---
 
@@ -594,14 +603,18 @@ per backend).
   **CB on 429 is necessary for APIM retry to actually route to fallbacks.** Without it, retry
   is unguided and returns to the saturated primary.
 
-- **Sequential client fallback: 100.0% (n=1) — matches or beats APIM CB+retry (93.5–98.0%).**
+- **Sequential client fallback: 100.0% (n=1, caveated) vs APIM CB+retry 93.5–98.0%.**
   `car_direct_spill` bypasses APIM entirely: the k6 client tries UK South first (429 expected),
-  then immediately tries West Europe (succeeds). Because the client acts on the first 429 with
-  no CB trip latency and no pool re-selection ambiguity, every request gets served by a region
-  with fresh quota. This outperforms APIM's best config, which loses the requests that hit UK
-  South before the CB threshold is reached. The trade-off: the direct approach requires the
-  client to hold API keys for all regions, and loses APIM's centralised policy, auth, and
-  observability layer.
+  then immediately tries West Europe (succeeds). The comparison is not fully like-for-like:
+  (a) the direct arm is a single run (n=1) vs n=3 for the APIM arm; (b) total HTTP calls are
+  not recorded in `direct_car_test.js` — a "success" costs one extra wasted call to UK South,
+  raising end-to-end latency (p50_succ=402 ms vs ~340 ms for APIM CB+retry); (c) the APIM
+  arm uses 90/5/5 weighted routing; the direct arm uses a fixed UK South–first ordering. The
+  mechanism advantage is real: the client reacts to the first 429 without a CB trip window, so
+  no requests are lost to the UK South saturation ramp. To confirm the finding, repeat with
+  `total_calls` instrumented and at least n=3 runs. The trade-off regardless: the direct
+  approach requires clients to hold API keys for all regions and bypasses APIM's centralised
+  policy, auth, and observability.
 
 ### Historical record (2026-11-01, pre-fix, not for article use)
 
@@ -638,13 +651,14 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    saturation (there are no 5xx errors, only 429s). It is the correct production CB setting: it
    protects against hard backend failures without interfering with quota redistribution.
 
-4. **Sustained throughput is governed by quota level, not routing configuration.** At 60K TPM,
-   both baseline and CB-only achieve the quota ceiling (~3.5 req/s), making them effectively
-   equivalent in goodput. Retry-enabled configs at 10K TPM achieve ~0.5 req/s, close to the
-   10K quota ceiling (~0.6 req/s). The original "APIM retry catastrophic at sustained (0.3% vs
-   2.4%)" finding compared unvalidated inflated baseline counts against reliable retry counts;
-   the corrected analysis shows all configs are ceiling-bound — the ceiling scales with quota,
-   not with routing config. To increase sustained throughput, increase quota.
+4. **At the same quota level, routing configuration does not materially change sustained
+   throughput.** At 60K TPM, baseline and CB-only both achieve the quota ceiling (~3.5 req/s)
+   — equivalent in goodput. The original "APIM retry catastrophic at sustained (0.3% vs 2.4%)"
+   finding compared unvalidated inflated baseline counts (14 ms p50, synthetic 200s) against
+   reliable retry counts; the corrected baseline at 60K TPM is also ceiling-bound. Whether
+   retry degrades sustained throughput relative to no-retry at the same quota level has not
+   been measured: the retry sustained runs are 10K only, the validated baseline is 60K only.
+   A like-for-like sustained comparison at 60K TPM with retry enabled is an open experiment.
 
 5. **CB without retry does not materially improve sustained throughput.** At 60K TPM, CB-only
    and baseline achieve statistically identical goodput (3.4 vs 3.6 req/s). CB changes the
@@ -678,15 +692,24 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    The retries-without-CB mechanism (re-entering 90/5/5 pool, re-hitting UK South ~90% of the
    time) is derived from pool weights, not measured per-backend.
 
-10. **Sequential client fallback at 2 req/s achieves 100% — matching or beating APIM's best
-    config (CB on 429 + retry: 93.5–98.0%).** The client acts on the first 429 immediately with
-    no CB trip latency, so no requests are lost to the UK South saturation window. The
-    trade-off is operational complexity: clients must hold API keys for all regions, and APIM's
-    centralised policy, auth, and observability are bypassed. For production use, the right choice
-    depends on whether that operational overhead is acceptable relative to the 2–6.5 percentage
-    point improvement over APIM CB+retry.
+10. **Sequential client fallback at 2 req/s achieved 100% in a single run vs APIM CB+retry's
+    93.5–98.0% across three runs.** The mechanism advantage is real — the client reacts to the
+    first 429 without a CB trip window — but the comparison carries caveats: n=1 direct run,
+    total HTTP calls not recorded (each "success" spends an extra call on UK South), and the
+    success latency is ~60 ms higher (402 ms vs ~340 ms). Repeat with total_calls instrumented
+    and n≥3 runs before citing as a definitive result. The operational trade-off is clear
+    regardless: direct requires per-region API keys and bypasses APIM's centralised policy and
+    observability. APIM's value is operational, not throughput.
 
-11. **The CAR-mode throughput ceiling scales linearly with TPM.** At 10 000 TPM the ceiling is
-    ~12 RPM per backend; at 60 000 TPM it is ~72 RPM — a 6× increase with 6× quota. For
-    quota-saturation experiments, CAR mode at a fixed arrival rate is more conservative and more
-    reproducible than closed-loop load, because fast failures do not inflate the offered load.
+11. **The CAR-mode throughput ceiling scales linearly with TPM — but the absolute rate is
+    anomalously low and the burst behaviour is not fully explained.** At 10 000 TPM the ceiling
+    is ~12 RPM per backend; at 60 000 TPM it is ~72 RPM — a 6× increase with 6× quota. At the
+    typical Azure ratio of ~6 RPM per 1 000 TPM, 10 000 TPM would allow ~60 RPM; the measured
+    ~12 RPM is ~5× below that. The reason (separate RPM cap, model-specific limit, or
+    subscription tier) has not been confirmed against the Azure portal. Additionally, the 60K
+    burst test achieves 96.5% at a rate that would exceed the 72 RPM CAR ceiling if sustained
+    — indicating the RPM limit applies differently to short bursts. Both open questions should
+    be investigated before drawing conclusions about quota efficiency or scaling.
+
+    For quota-saturation experiments, CAR mode at a fixed arrival rate is more conservative and
+    more reproducible than closed-loop load, because fast failures do not inflate the offered load.

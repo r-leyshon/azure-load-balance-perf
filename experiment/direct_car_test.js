@@ -38,6 +38,7 @@ export const options = {
 
 const originalIterations = new Counter("original_iterations");
 const eventualSuccesses  = new Counter("eventual_successes");
+const totalHttpCalls     = new Counter("total_http_calls");
 const timeToSuccess      = new Trend("time_to_success", true);
 
 const PAYLOAD = JSON.stringify({
@@ -63,6 +64,7 @@ export default function () {
   // Moves to the next region on any non-200 response (429, 5xx, etc.).
   for (const ep of ENDPOINTS) {
     const res = http.post(buildUrl(ep), PAYLOAD, { headers: buildHeaders(ep) });
+    totalHttpCalls.add(1);
     finalRes = res;
     if (res.status === 200) {
       try {
