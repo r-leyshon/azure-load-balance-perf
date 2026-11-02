@@ -29,9 +29,10 @@ resource "azurerm_api_management_backend" "foundry" {
 }
 
 # Per-backend circuit breaker rules, applied via azapi to access the full ARM schema.
-# Only created when circuit_breaker_failure_count > 0.
+# Always present so that count=0 explicitly clears rules rather than leaving prior
+# config on the backend (azapi_update_resource destroy does not reset Azure state).
 resource "azapi_update_resource" "circuit_breaker" {
-  for_each = var.circuit_breaker_failure_count > 0 ? local.foundry_regions : {}
+  for_each = local.foundry_regions
 
   type        = "Microsoft.ApiManagement/service/backends@2023-09-01-preview"
   resource_id = azurerm_api_management_backend.foundry[each.key].id
@@ -40,7 +41,7 @@ resource "azapi_update_resource" "circuit_breaker" {
   body = {
     properties = {
       circuitBreaker = {
-        rules = [
+        rules = var.circuit_breaker_failure_count > 0 ? [
           {
             name             = "trip-on-overload"
             tripDuration     = "PT60S"
@@ -54,7 +55,7 @@ resource "azapi_update_resource" "circuit_breaker" {
               )
             }
           }
-        ]
+        ] : []
       }
     }
   }
