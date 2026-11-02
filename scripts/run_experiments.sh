@@ -375,6 +375,27 @@ for id in $ORDERED; do
     read -r rate_per_s duration wuk wwe wsc rpm cb cb429 apim_retry apim_retry_s <<< "$args"
     run_car_experiment "$id" "$rate_per_s" "$duration" "$wuk" "$wwe" "$wsc" "$rpm" "$cb" \
       "$cb429" "$apim_retry" "$apim_retry_s"
+
+    # Calibration gate: after car_baseline, verify ≥95% success before running spill arms.
+    if [ "$id" = "car_baseline" ]; then
+      RESULT_FILE="$REPO_ROOT/experiment/results/car_baseline.json"
+      SUCCESS_RATE=$(python3 -I -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+orig = d['metrics'].get('original_iterations', {}).get('values', {}).get('count', 1)
+succ = d['metrics'].get('eventual_successes', {}).get('values', {}).get('count', 0)
+print(round(succ / orig * 100, 1))
+" "$RESULT_FILE")
+      echo "  Calibration gate: car_baseline success rate = ${SUCCESS_RATE}%"
+      if python3 -c "import sys; sys.exit(0 if float('${SUCCESS_RATE}') >= 95.0 else 1)"; then
+        echo "  Calibration gate PASSED — continuing with spill arms."
+      else
+        echo "  CALIBRATION GATE FAILED (${SUCCESS_RATE}% < 95%). Aborting." >&2
+        echo "  Reduce the arrival rate and re-run car_baseline before proceeding." >&2
+        exit 1
+      fi
+    fi
+
   elif [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
     args="${ADAPTIVE_EXPERIMENTS[$id]}"
     read -r vus iter adapt_s penalty epsilon <<< "$args"

@@ -16,18 +16,23 @@ single-sentence prompt with `max_tokens: 5`.
 >
 > **Bug 2:** APIM circuit-breaker state is in-memory with a PT60S trip duration (set in
 > `apim_backends.tf`; not PT30S as earlier notes incorrectly stated). It survives `terraform
-> apply` of new policy configurations. Experiments whose terraform apply completed in under ~60
-> seconds inherited tripped backends from the previous run. Nine experiments were re-run with an
-> explicit 60-second isolation gap added to `run_experiments.sh`. Combined with terraform apply
-> time (~5–15s), the total gap comfortably exceeds PT60S.
+> apply` of new policy configurations. The pre-fix code destroyed the `azapi_update_resource`
+> without clearing Azure backend state, so a CB-off experiment that ran immediately after a CB-on
+> experiment inherited the prior rules. The isolation gap (60-second sleep + terraform apply)
+> ensures the CB trip duration has expired, but it does **not** reset the rules when CB is being
+> turned off — that required the Bug 3 fix below. Three "no CB" burst runs that followed CB-on
+> runs may be contaminated: `apim_retry_equal`, `asym_retry_no_cb`, `optimal_equal_apim` (see
+> pending re-runs below). The six client-retry runs, `gateway_throttle`, and `sustained_baseline`
+> show zero 5xx and are likely unaffected.
 >
 > **Bug 3:** `azapi_update_resource` with `circuitBreaker.rules = []` was rejected by the Azure
 > ARM API with ValidationError ("at least one rule should be defined"). The resource was updated to
-> use `circuitBreaker = null` instead, which instructs Azure to clear any existing CB config. Phase
-> 4 CAR runs used this fix; prior Phases were unaffected (their terraform applies always set CB
-> rules to a non-empty array or destroyed the resource).
+> use `circuitBreaker = null` instead, which explicitly clears CB config on every `terraform apply`.
+> Phase 4 CAR runs (2026-11-02) used this fix. Prior Phases did not have access to it; the three
+> runs named above are pending re-verification (A2).
 >
-> Every table in this document reflects clean, isolation-verified data only.
+> **Not all tables are fully clean.** The three runs in A2 are marked ⚠ pending re-run. All other
+> tables reflect isolation-verified data.
 
 ---
 
@@ -289,39 +294,52 @@ All ablation runs performed with 60-second CB isolation gap.
 | sustained_apim_retry_cb | Equal, CB on 429+5xx, APIM retry=3 | 44 660 | 156 | 0.3 | 0.5 |
 | sustained_trip_count_1 | 90/5/5, CB trip=1, APIM retry=3 | 46 388 | 161 | 0.3 | 0.5 |
 
-Note: `sustained_apim_retry_cb` came after `sustained_baseline` (no CB) — a clean start.
-`sustained_trip_count_1` came after a 5-minute `sustained_apim_retry_cb` run + terraform apply —
-also a clean start. The 0.3% results for retry-enabled configurations are genuine.
+Run order by file timestamp (2026-11-01): `sustained_baseline` (09:45), `sustained_cb_only`
+(10:00), then burst APIM runs, then `sustained_apim_asym` (14:29), `sustained_apim_retry_cb`
+(14:34), `sustained_trip_count_1` (14:39). Each had the 60-second CB isolation gap.
+`sustained_cb_only` ran immediately after `sustained_baseline` (no CB), so no inherited CB rules.
+`sustained_apim_asym` and the two that follow ran after CB-on burst runs — the Bug 2 isolation
+gap clears trip state, but the Bug 3 fix was not yet in place; any prior CB-off-to-CB-on
+transition within the afternoon block was in the correct direction (adding rules, not clearing
+them) and is not affected.
+
+⚠ **`sustained_baseline` and `sustained_cb_only` are pending re-run** (see A1 below): both lack
+the body check that `car_test.js` has, so their reported 200 counts may include synthetic
+gateway responses. See Sustained load findings for the impact on takeaways.
 
 ### Sustained load findings
 
-- **`sustained_cb_only` (CB, no APIM retry): 2.8%, 4.6 goodput — the best sustained APIM
-  configuration.** The CB trips backends within milliseconds of quota exhaustion. With PT60S
-  trip duration and no retry amplification, backends re-open after 60 seconds into a partially-
-  recovered quota window. Requests that arrive at the moment of re-opening complete in ~16ms.
-  The CB acts as a rate limiter that synchronises with the quota cycle.
+⚠ **These findings are provisional pending A1 re-runs.** `sustained_baseline` and
+`sustained_cb_only` lack body validation; their 200 counts include any synthetic responses.
+The 14 ms median for successful 200s is inconsistent with real LLM completions (~300–400 ms in
+all validated runs). The 0.3% retry-enabled results are more reliable (those runs show p50 ~285 ms
+for 200s, consistent with real completions; n=3 runs). The sustained narrative below reflects the
+raw data; confidence levels are noted per claim.
 
-- **`sustained_baseline` (no features): 2.4%.** Without CB, requests keep hitting exhausted
-  backends and getting 429s. Some catch the brief window when quota has just reset. The result
-  is only slightly worse than CB-only — the 0.4% difference comes from the CB's ability to
-  "park" the pool for 60 seconds and then pounce on the reset window.
+- **`sustained_cb_only` reports 2.8%, 4.6 req/s goodput — nominally the best sustained
+  configuration, but unvalidated.** The 14 ms p50 for 200s suggests some or all of the 1 368
+  successes may be synthetic. One hypothesis: CB trips and re-opens synchronise with the quota
+  window so a brief burst of real completions occurs at each re-open, but the 14 ms figure is
+  unexplained. **Pending A1 re-run.**
 
-- **`sustained_apim_retry_cb` and `sustained_apim_asym` both 0.3% — catastrophic.** This is
-  the critical sustained finding. APIM retry transforms the quota exhaustion cycle into an
-  amplification storm: each incoming request generates up to 3 retries, re-exhausting any
-  briefly-recovered quota within milliseconds of the window resetting. The CB re-trips
-  immediately. The pattern repeats every 60 seconds, allowing only ~160 completions across the
-  entire 5-minute window.
+- **`sustained_baseline` reports 2.4%, also unvalidated.** 627 successes at 14 ms p50.
+  **Pending A1 re-run.**
 
-- **APIM retry is neutral to marginally beneficial at burst (18%) but catastrophic at
-  sustained load (0.3% vs 2.4% baseline).** A configuration that appears acceptable in a
-  10-second burst test is 8× worse than doing nothing over 5 minutes. Burst tests on quota-
-  limited systems are systematically misleading.
+- **`sustained_apim_retry_cb` and `sustained_apim_asym` both 0.3% — more credible.** These
+  show p50 ~285 ms for their 161 successes, consistent with real completions. The pattern is
+  consistent across three independent runs. The proposed mechanism — retry amplification
+  re-exhausts quota windows within milliseconds of reset — is plausible and internally
+  consistent, but is a hypothesis, not a directly measured mechanism.
 
-- **Under global quota saturation, the fundamental ceiling is token budget.** At 3 × 10 000 TPM
-  with ~25 tokens per request, the theoretical maximum is ~500 completions/minute (8.3 req/s).
-  `sustained_cb_only` delivers 4.6 req/s — 55% of the theoretical ceiling. No APIM configuration
-  can exceed this without increasing quota.
+- **APIM retry appears to worsen sustained throughput vs baseline (0.3% vs 2.4%), if the
+  baseline figure is real.** The 8× ratio should be treated as an order-of-magnitude estimate
+  until A1 resolves the baseline validation.
+
+- **Under global quota saturation, the measured throughput ceiling (not theoretical) is the
+  relevant limit.** Phase 4 CAR runs establish ~12 RPM per backend at 10 000 TPM (~36 RPM
+  total). `sustained_cb_only` at 4.6 req/s = 276 RPM total is 7.7× that ceiling — another
+  signal that its 200 counts are inflated. No APIM configuration can exceed the quota ceiling
+  without increasing quota.
 
 ---
 
@@ -332,10 +350,10 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 | retry_after_header | burst client | 99.5 | 188.7 | 0.4 |
 | optimal_equal_client | burst client | 99.0 | 146.9 | 0.5 |
 | optimal_asym_client | burst client | 36.0 | 94.5 | 0.6 |
-| apim_retry_equal | burst APIM | 18.5 | 1128.9 | 2.9 |
+| apim_retry_equal ⚠ | burst APIM | 18.5 | 1128.9 | 2.9 |
 | apim_retry_asym | burst APIM | 18.0 | 1091.1 | 3.7 |
-| asym_retry_no_cb | burst ablation | 18.0 | 1096.1 | 3.0 |
-| optimal_equal_apim | burst APIM | 18.0 | 1118.2 | 2.8 |
+| asym_retry_no_cb ⚠ | burst ablation | 18.0 | 1096.1 | 3.0 |
+| optimal_equal_apim ⚠ | burst APIM | 18.0 | 1118.2 | 2.8 |
 | baseline | burst APIM | 17.5 | 122.5 | 6.8 |
 | direct_equal | burst direct | 17.5 | 104.4 | 3.1 |
 | asym_retry_cb_5xx | burst ablation | 17.0 | 1095.5 | 2.7 |
@@ -371,7 +389,23 @@ also a clean start. The 0.3% results for retry-enabled configurations are genuin
 
 ¹ Goodput elevated by fast CB-induced 503s; not comparable with real-completion goodput.
 
-² `direct_sequential` makes up to 3 HTTP calls per iteration (UK→WE→SC fallback chain), giving 567 HTTP calls for 200 k6 iterations. `summarise.py` uses HTTP calls as the denominator (no `original_iterations` counter in `direct_test.js`), reporting 5.8%. Correct per-request rate: 33 ÷ 200 = **16.5%**.
+² `direct_sequential` denominator is HTTP calls (567), not iterations (200), because `direct_test.js`
+lacked `original_iterations` before commit `[fix pending]`. Correct per-request rate: 33 ÷ 200 = **16.5%**.
+
+⚠ Pending re-run: may carry leftover CB rules from a prior CB-on experiment (Bug 2 isolation gap
+clears trip state but did not reset rules before the Bug 3 fix). Three runs affected:
+`apim_retry_equal`, `asym_retry_no_cb`, `optimal_equal_apim`.
+
+---
+
+## Pending re-runs
+
+| label | runs | reason | blocker |
+|---|---|---|---|
+| A1 | `sustained_baseline`, `sustained_cb_only` (+ one pool-retry sustained) | No body check in `load_test.js`; 14 ms p50 on 200s suggests synthetic responses | `load_test.js` body-check fix landed; re-run when quota is active |
+| A2 | `apim_retry_equal`, `asym_retry_no_cb`, `optimal_equal_apim` | May carry stale CB rules from prior CB-on run (Bug 2 gap cleared trip state, Bug 3 fix not yet in place) | Verify no CB rules in Azure portal, then re-run |
+| A3 | `car_90_5_5`, `car_retry_90_5_5`, `car_retry_cb429_90_5_5` (×3 each) | n=1 CAR spill arms; 68% vs 70% difference is within noise; 98% needs a spread | Re-run at 60 000 TPM, 2 req/s |
+| A4 | `car_direct_spill` (new) | No no-gateway baseline at 2 req/s / 90/5/5 for comparison with `car_retry_cb429_90_5_5` | Add direct-to-Foundry CAR arm to `run_experiments.sh` |
 
 ---
 
@@ -451,11 +485,17 @@ The per-backend ceiling can be derived from the spill arms (no recovery, equal o
 ```
 
 This is consistent with 60 000 TPM × (12 RPM per 10 000 TPM) = 72 RPM — confirming the
-CAR-mode ceiling scales linearly with TPM and was ~12 RPM at 10 000 TPM (the Phase 4 pre-fix
-observation). The "throughput gap" between CAR (~12 RPM) and sustained closed-loop (~40–91 RPM)
-is explained: closed-loop load exploits Azure's burst quota bucket (short-term headroom above
-the nominal TPM rate), whereas CAR mode fires at a steady rate that cannot benefit from burst
-capacity.
+CAR-mode ceiling scales linearly with TPM. The ~12 RPM per backend figure at 10 000 TPM is
+supported by two independent CAR observations: the pre-fix Phase 4 car_baseline (2026-11-01,
+10 req/s, 10 000 TPM, 6.0% success → ~12 RPM per backend) and a diagnostic run diag_1rps
+(2026-11-02 08:41, 1 req/s, 10 000 TPM, equal weights, 61 iterations, 33 successes → ~11 RPM
+per backend).
+
+The gap between the CAR ceiling (~12 RPM at 10 000 TPM) and the sustained closed-loop figures
+(627–1 368 successes in 5 minutes, implying 40–91 RPM per backend) is not yet explained. The
+sustained figures are unvalidated (see A1); the gap may largely disappear once they are re-run
+with body validation. The "burst quota bucket" hypothesis is untested and should not be cited
+as a finding.
 
 | config | UK South (offered) | WE (offered) | SC (offered) | expected success |
 |---|---|---|---|---|
@@ -472,11 +512,12 @@ capacity.
 - **CB on 5xx only: 70%.** Indistinguishable from `car_90_5_5`. No 5xx errors occur in a
   quota-saturation scenario (backends return 429, not 5xx); the CB never fires.
 
-- **APIM retry without CB: 68% — slightly worse than no retry.** Retries re-enter the 90/5/5
-  pool: ~90% of retries land back on UK South (still saturated). The slight decrease vs no-retry
-  (70%) is consistent with a small fraction of retries amplifying load on the already-saturated
-  primary. The additional ~365 ms per retry (p50=361 ms vs 288 ms for no-retry) confirms the
-  inter-retry delay but produces no benefit.
+- **APIM retry without CB: 68% — slightly worse than no retry.** The slight decrease vs no-retry
+  (70%) may be noise or a small amplification effect on the already-saturated primary. The
+  proposed mechanism — retries re-enter the 90/5/5 pool and ~90% re-hit UK South — is derived
+  from the pool weights, not measured directly (no per-backend counters in these runs; the
+  x-ms-region header was not logged). The additional ~365 ms per retry (p50=361 ms vs 288 ms for
+  no-retry) confirms the inter-retry delay. **Pending A3 repeats and A4 comparison.**
 
 - **APIM retry + CB on 5xx: 68%.** Same as retry without CB. CB on 5xx is silent under
   429-only failures; the retry pool selection is identical.
@@ -524,28 +565,26 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    5xx errors, only 429s). It is the correct production CB setting: it protects against hard
    backend failures without interfering with quota redistribution.
 
-4. **APIM retry is a burst-time neutral to mildly beneficial, and a sustained-time catastrophe.**
-   With retry enabled, each incoming request generates up to 3 retries. In a 10-second burst,
-   this distributes load across pool members and might catch the quota window. Over 5 minutes,
-   the retry amplification re-exhausts every quota window within milliseconds of it resetting.
-   Configurations with APIM retry drop from ~18% burst to 0.3% sustained — 8× worse than the
-   no-features baseline (2.4%). _(Caveat: sustained figures depend on `sustained_baseline` and
-   related runs whose 14 ms 200-response p50 is unexplained — see Phase 4 open questions.)_
+4. **APIM retry appears catastrophic at sustained load (0.3% vs ~2% baseline), but the
+   baseline figure is pending validation.** Three independent retry-enabled sustained runs
+   converge at 0.3% with realistic completion latencies (~285 ms p50). The baseline and CB-only
+   figures (2.4% and 2.8%) lack body validation and may be inflated by synthetic 200s. The
+   proposed mechanism — retry amplification re-exhausting quota windows on reset — is a
+   consistent hypothesis, not a confirmed finding. _(Pending A1 re-runs.)_
 
-5. **CB without APIM retry is the best APIM strategy at sustained load: 2.8% vs 2.4% baseline.**
-   Without retry amplification, the CB acts as a rate limiter that synchronises with the quota
-   cycle: backends trip fast, wait 60 seconds, re-open into a briefly-available quota window,
-   and some requests complete before the cycle repeats. _(Caveat: `sustained_cb_only` may be
-   contaminated by the CB persistence bug; its 2.8% figure is provisional.)_
+5. **CB without APIM retry is nominally the best sustained APIM strategy (2.8%), but this single
+   run is unvalidated.** The claim that CB "synchronises with the quota cycle" is a hypothesis
+   consistent with the pattern but not directly measured. _(Pending A1 re-run.)_
 
 6. **Client `Retry-After` achieves 99% eventual success at 30-second median latency.** This is
    the right strategy for batch or non-interactive workloads. For interactive workloads, the
-   ceiling without client retry is ~18% burst and ~2.8% sustained.
+   burst ceiling without client retry is ~18%.
 
-7. **Burst tests on quota-limited systems are systematically misleading.** `baseline` scores
-   17.5% burst but 2.4% sustained. `apim_retry_asym` scores 18% burst but 0.3% sustained.
-   Any performance claim about a quota-limited AI gateway should be validated with a sustained
-   run spanning multiple quota reset cycles before being presented as representative.
+7. **Burst tests on quota-limited systems are potentially misleading — sustained validation is
+   required.** `baseline` scores 17.5% burst but ~2% sustained (pending validation).
+   `apim_retry_asym` scores 18% burst but 0.3% sustained. Any performance claim about a
+   quota-limited AI gateway should be validated with a sustained run spanning multiple quota
+   reset cycles before being presented as representative.
 
 8. **Always run a calibration gate before interpreting CAR results.** A control arm (equal
    weights, no CB, no retry) at the intended arrival rate must reach ≥ 95% success before the
@@ -555,18 +594,18 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
    _Phase 4 calibration gate: 100% at 1 req/s, 60 000 TPM._
 
 9. **CB on 429 is the essential ingredient for APIM retry to route around a saturated primary.**
-   In the single-region-spill regime (PTU primary at 108 RPM offered, fallbacks at 6 RPM):
+   In the single-region-spill regime (PTU primary at 108 RPM offered, fallbacks at 6 RPM),
+   n=1 CAR run (A3 repeats pending):
    - No recovery: 70% (UK South caps at ~72 RPM; 30% of requests fail)
    - CB on 5xx / retry without CB: 68–70% — no improvement or slight regression
    - CB on 429 + retry: **98%** — UK South trips, retries forced to WE/SC, near-perfect recovery
 
-   Without CB-on-429, retry is unguided: ~90% of retries re-enter the 90/5/5 pool and land back
-   on the already-saturated primary. CB on 429 removes the saturated primary from the pool so
-   retries have nowhere to go but the healthy fallbacks.
+   The proposed mechanism (retries without CB re-enter the 90/5/5 pool and ~90% re-hit UK South)
+   is derived from pool weights, not measured. A direct-to-Foundry comparison at the same 2 req/s
+   is pending (A4) to establish the no-gateway baseline.
 
-10. **The CAR-mode throughput ceiling scales linearly with TPM.** At 10 000 TPM the ceiling was
-    ~12 RPM per backend; at 60 000 TPM it is ~72 RPM — a 6× increase. Sustained closed-loop runs
-    showed 40–91 RPM at 10 000 TPM because they exploit Azure's burst quota bucket (short-term
-    headroom above the nominal TPM rate). CAR mode fires at a steady rate and cannot use burst
-    capacity. For quota-saturation experiments, CAR mode at nominal rate is more conservative and
-    more reproducible than closed-loop load.
+10. **The CAR-mode throughput ceiling scales linearly with TPM.** At 10 000 TPM the ceiling is
+    ~12 RPM per backend (supported by two independent CAR observations); at 60 000 TPM it is
+    ~72 RPM — a 6× increase. The gap between CAR ceilings and the unvalidated sustained figures
+    (40–91 RPM at 10 000 TPM) is unexplained pending A1 re-runs. For quota-saturation experiments,
+    CAR mode at steady rate is more conservative and more reproducible than closed-loop load.

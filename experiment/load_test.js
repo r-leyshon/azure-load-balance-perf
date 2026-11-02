@@ -81,6 +81,7 @@ export default function () {
   const startMs = Date.now();
   let attempts  = 0;
   let succeeded = false;
+  let bodyValid = false;
   let lastRes;
 
   do {
@@ -89,7 +90,11 @@ export default function () {
     totalHttpCalls.add(1);
 
     if (lastRes.status === 200) {
-      succeeded = true;
+      try {
+        const body = JSON.parse(lastRes.body);
+        bodyValid = Array.isArray(body.choices) && body.choices.length > 0;
+      } catch { /* non-JSON 200 — synthetic gateway response */ }
+      if (bodyValid) succeeded = true;
       break;
     }
 
@@ -110,6 +115,7 @@ export default function () {
 
   check(lastRes, {
     "http 200 ok":        (r) => r.status === 200,
+    "body has choices":   () => lastRes.status !== 200 || bodyValid,
     "http 429 throttled": (r) => r.status === 429,
     "no server error":    (r) => r.status < 500,
   });

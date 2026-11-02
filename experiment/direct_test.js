@@ -1,5 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
+import { Counter } from "k6/metrics";
 
 // All configuration comes from environment variables — no values hardcoded.
 const DEPLOYMENT_ID = __ENV.DEPLOYMENT_ID || "chat";
@@ -30,6 +31,9 @@ export const options = {
   summaryTrendStats: ["avg", "p(50)", "p(95)", "p(99)", "max"],
 };
 
+const originalIterations = new Counter("original_iterations");
+const eventualSuccesses  = new Counter("eventual_successes");
+
 const PAYLOAD = JSON.stringify({
   messages: [{ role: "user", content: "Reply with exactly one word: Hello." }],
   max_tokens: 5,
@@ -59,6 +63,7 @@ function weightedPick() {
 }
 
 export default function () {
+  originalIterations.add(1);
   let res;
 
   if (MODE === "sequential") {
@@ -73,8 +78,18 @@ export default function () {
     res = http.post(buildUrl(ep), PAYLOAD, { headers: buildHeaders(ep) });
   }
 
+  let bodyValid = false;
+  if (res.status === 200) {
+    try {
+      const body = JSON.parse(res.body);
+      bodyValid = Array.isArray(body.choices) && body.choices.length > 0;
+    } catch { /* non-JSON 200 */ }
+  }
+  if (bodyValid) eventualSuccesses.add(1);
+
   check(res, {
     "http 200 ok":        (r) => r.status === 200,
+    "body has choices":   () => res.status !== 200 || bodyValid,
     "http 429 throttled": (r) => r.status === 429,
     "no server error":    (r) => r.status < 500,
   });
