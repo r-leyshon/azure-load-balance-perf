@@ -186,6 +186,39 @@ run_car_experiment() {
 }
 
 # ---------------------------------------------------------------------------
+# run_direct_car_experiment  id  rate_per_s  duration
+#
+# Calls direct_car_test.js (Foundry API key auth, sequential fallback, no APIM).
+# No terraform apply needed — this is a client-side comparison arm.
+# ---------------------------------------------------------------------------
+run_direct_car_experiment() {
+  local id="$1"
+  local rate_per_s="$2"
+  local duration="$3"
+
+  echo ""
+  echo "========================================"
+  echo "  Direct CAR experiment: $id"
+  echo "========================================"
+
+  cd "$REPO_ROOT"
+  k6 run \
+    -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+    -e FOUNDRY_ENDPOINT_UKSOUTH="$FOUNDRY_ENDPOINT_UKSOUTH" \
+    -e FOUNDRY_KEY_UKSOUTH="$FOUNDRY_KEY_UKSOUTH" \
+    -e FOUNDRY_ENDPOINT_WESTEUROPE="$FOUNDRY_ENDPOINT_WESTEUROPE" \
+    -e FOUNDRY_KEY_WESTEUROPE="$FOUNDRY_KEY_WESTEUROPE" \
+    -e FOUNDRY_ENDPOINT_SWEDENCENTRAL="$FOUNDRY_ENDPOINT_SWEDENCENTRAL" \
+    -e FOUNDRY_KEY_SWEDENCENTRAL="$FOUNDRY_KEY_SWEDENCENTRAL" \
+    -e RUN_ID="$id" \
+    -e RATE_PER_S="$rate_per_s" \
+    -e DURATION="$duration" \
+    experiment/direct_car_test.js
+
+  echo "  Done: results written to experiment/results/${id}.json"
+}
+
+# ---------------------------------------------------------------------------
 # run_adaptive_experiment  id  vus  iter_or_duration  adapt_s  penalty  epsilon
 #
 # Calls adaptive_test.js (Foundry API key auth, no APIM). Weights start equal
@@ -292,6 +325,16 @@ EXPERIMENTS["weight_70_15_15"]="20 200 70 15 15 10000 3 true 3 1 none 3 500"  # 
 EXPERIMENTS["weight_80_10_10"]="20 200 80 10 10 10000 3 true 3 1 none 3 500"  # weight sweep
 EXPERIMENTS["trip_count_1"]="20 200 90 5 5 10000 1 true 3 1 none 3 500"       # CB trips on 1st failure
 
+# A1 re-runs — sustained_baseline and sustained_cb_only now have body check in load_test.js
+EXPERIMENTS["sustained_baseline_r2"]="20 5m 33 33 34 10000 0 true 0 1 none 3 500"
+EXPERIMENTS["sustained_cb_only_r2"]="20 5m 33 33 34 10000 3 true 0 1 none 3 500"
+
+# A2 re-runs — apim_retry_equal / asym_retry_no_cb / optimal_equal_apim may have carried
+# stale CB rules; re-run after Bug 3 fix ensures clean state via circuitBreaker = null
+EXPERIMENTS["apim_retry_equal_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
+EXPERIMENTS["asym_retry_no_cb_r2"]="20 200 90 5 5 10000 0 true 3 1 none 3 500"
+EXPERIMENTS["optimal_equal_apim_r2"]="20 200 33 33 34 10000 0 true 3 1 none 3 500"
+
 # ---------------------------------------------------------------------------
 # Phase 4 — constant-arrival-rate (CAR) experiment definitions
 # Format: "rate_per_s duration wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s"
@@ -319,6 +362,26 @@ CAR_EXPERIMENTS["car_retry_cb5xx_90_5_5"]="2 5m 90 5 5 10000 3 false 3 1"
 # CB on 429+5xx + retry: UK South trips on 429s and is removed from the pool, so retries
 # are forced to WE/SC. Tests whether routing to fallbacks requires CB-on-429.
 CAR_EXPERIMENTS["car_retry_cb429_90_5_5"]="2 5m 90 5 5 10000 3 true 3 1"
+
+# A3 repeats — ×3 runs for the three most informative spill arms.
+CAR_EXPERIMENTS["car_90_5_5_r2"]="2 5m 90 5 5 10000 0 false 0 1"
+CAR_EXPERIMENTS["car_90_5_5_r3"]="2 5m 90 5 5 10000 0 false 0 1"
+CAR_EXPERIMENTS["car_retry_90_5_5_r2"]="2 5m 90 5 5 10000 0 false 3 1"
+CAR_EXPERIMENTS["car_retry_90_5_5_r3"]="2 5m 90 5 5 10000 0 false 3 1"
+CAR_EXPERIMENTS["car_retry_cb429_90_5_5_r2"]="2 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["car_retry_cb429_90_5_5_r3"]="2 5m 90 5 5 10000 3 true 3 1"
+
+# ---------------------------------------------------------------------------
+# Direct CAR experiment definitions
+# Format: "rate_per_s duration"
+# Direct Foundry calls, sequential fallback UK South → WE → SC. No APIM.
+# ---------------------------------------------------------------------------
+
+declare -A DIRECT_CAR_EXPERIMENTS
+# A4: no-gateway comparison at the same rate as the spill arms. UK South receives all
+# first attempts (saturates); overflow falls back to WE then SC. Compare with
+# car_retry_cb429_90_5_5 (98%) to quantify the APIM gateway value at this load.
+DIRECT_CAR_EXPERIMENTS["car_direct_spill"]="2 5m"
 
 # ---------------------------------------------------------------------------
 # Direct experiment definitions
@@ -396,6 +459,10 @@ print(round(succ / orig * 100, 1))
       fi
     fi
 
+  elif [ -n "${DIRECT_CAR_EXPERIMENTS[$id]+_}" ]; then
+    args="${DIRECT_CAR_EXPERIMENTS[$id]}"
+    read -r rate_per_s duration <<< "$args"
+    run_direct_car_experiment "$id" "$rate_per_s" "$duration"
   elif [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
     args="${ADAPTIVE_EXPERIMENTS[$id]}"
     read -r vus iter adapt_s penalty epsilon <<< "$args"
