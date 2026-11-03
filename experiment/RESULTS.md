@@ -726,3 +726,141 @@ The calibration gate failed at 6.0% (global saturation; no spill scenario). Reta
 
     For quota-saturation experiments, CAR mode at a fixed arrival rate is more conservative and
     more reproducible than closed-loop load, because fast failures do not inflate the offered load.
+
+---
+
+## Phase 5 — Matched-pair APIM vs direct client comparison
+
+### Motivation
+
+Phase 4 showed APIM CB+retry at 96.5–99.3% vs sequential direct at 100.0%, but the two sides
+were not under identical conditions: the direct client uses a fixed UK South–first ordering while
+APIM uses a 90/5/5 weighted pool. Any difference could come from that mismatch rather than from
+where the failover logic sits. Phase 5 corrects this by making every variable identical except
+the location of the retry logic.
+
+### Decision criterion (written 2026-11-03, before any Phase 5 runs)
+
+**APIM adds measurable performance value** if, for any matched pair (same traffic split, same
+retry logic, same memory/CB rule) across ≥3 repeats, the median APIM success rate exceeds the
+matched client median by **> 2 percentage points**, OR the median APIM p95 latency is **> 50 ms
+lower** than the matched client.
+
+If no matched pair meets either threshold across Scenario A: APIM's value is operational
+(credentials, centralised policy, observability) — not throughput.
+
+### What must be identical in every matched pair
+
+| Dimension | Both sides |
+|---|---|
+| Quota per region | 60 000 TPM |
+| Arrival rate | Fixed (CAR executor) |
+| Traffic split | Same weights / same ordering |
+| Max attempts per request | 3 |
+| Wait between attempts | None (immediate) |
+| Region selection rule on retry | Matched (see grid below) |
+| Failure memory rule | Matched (none, or 60 s cooldown) |
+| Success definition | HTTP 200 + `choices[]` body check |
+| Timing | `time_to_success` from first attempt to final 200 |
+
+### Matching logic
+
+| Client arm | APIM arm | Selection rule | Memory rule |
+|---|---|---|---|
+| `direct_seq` (existing n=3) | `apim_priority` (new) | UK South first; fallbacks equally on failure | None |
+| `direct_seq_mem` (new) | `apim_priority` (CB trip=1) | UK South first; fallbacks on failure | 60 s per-VU (client) / per-CB (APIM) |
+| `direct_weighted` (new) | `apim_retry_no_cb` (existing n=3) | 90/5/5 weighted, re-enters full pool on retry | None |
+| `direct_weighted_mem` (new) | `apim_retry_cb` (existing n=3) | 90/5/5 weighted, excludes 429-flagged regions | 60 s per-VU (client) / CB trip=3 (APIM) |
+
+**Differences to document, not eliminate:**
+- APIM CB is global (shared across all VUs). Client memory is per-VU. After a 429, all APIM
+  traffic avoids UK South immediately; with per-VU memory, VUs that haven't yet seen a 429
+  continue hitting UK South for a short period. This is a real asymmetry — record it, do not
+  hide it.
+- APIM retry interval: configurable via `apim_retry_interval_s` (currently 1 s). Client retries
+  are immediate. Phase 5 APIM runs use `apim_retry_s=1`. Actual retry timing is recorded from
+  `tts_p50_ms`.
+
+---
+
+### Scenario A — Spill regime, 2 req/s, UK South saturated
+
+UK South offered: 90% × 2 req/s = 1.8 req/s = 108 RPM > 72 RPM ceiling.
+WE and SC offered: 5% × 2 req/s = 6 RPM each — well under ceiling.
+
+**Run order (interleaved; 60 s gap before each run for quota reset):**
+1. `p5a_direct_seq_r4` / `p5a_direct_seq_r5`  (direct_seq, existing arm, 2 more to reach n=5)
+2. `p5a_apim_priority_r1` … `_r5`  (new APIM priority pool arm, n=5)
+3. `p5a_direct_seq_mem_r1` … `_r5`  (direct_seq with 60s memory, new, n=5)
+4. `p5a_apim_retry_cb_r4` / `_r5`  (apim_retry_cb, 2 more to reach n=5)
+5. `p5a_apim_retry_cb_trip1_r2` … `_r5`  (4 more to reach n=5)
+6. `p5a_direct_weighted_r1` … `_r5`  (new weighted client, no memory, n=5)
+7. `p5a_apim_retry_no_cb_r4` / `_r5`  (2 more to reach n=5)
+8. `p5a_direct_weighted_mem_r1` … `_r5`  (new weighted client, 60s memory, n=5)
+
+**Results (to be filled after runs):**
+
+| arm | r1 | r2 | r3 | r4 | r5 | median | p95_ms |
+|---|---|---|---|---|---|---|---|
+| `direct_seq` | 100.0 | 100.0 | 100.0 | — | — | — | — |
+| `direct_seq_mem` | — | — | — | — | — | — | — |
+| `direct_weighted` | — | — | — | — | — | — | — |
+| `direct_weighted_mem` | — | — | — | — | — | — | — |
+| `apim_retry_no_cb` | 68.2 | 68.2 | 69.1 | — | — | — | — |
+| `apim_retry_cb` | 98.0 | 98.0 | 93.5 | — | — | — | — |
+| `apim_retry_cb_trip1` | 99.3 | — | — | — | — | — | — |
+| `apim_priority` | — | — | — | — | — | — | — |
+
+*r1–r3 for direct_seq = car_direct_spill[_r2][_r3]. r1–r3 for apim_retry_no_cb = car_retry_90_5_5[_r2][_r3]. r1–r3 for apim_retry_cb = car_retry_cb429_90_5_5[_r2][_r3]. r1 for apim_retry_cb_trip1 = car_retry_cb429_90_5_5_trip1.*
+
+---
+
+### Scenario B — Near fallback limit, 3 req/s
+
+UK South offered: 162 RPM >> 72 ceiling. After UK South trips, each fallback receives ~90 RPM —
+close to the 72 RPM ceiling. Tests whether CB+retry remains effective when fallbacks themselves
+approach saturation.
+
+**Run order (interleaved, 60 s gap):**
+1. `p5b_direct_seq_r1..r3`
+2. `p5b_apim_priority_r1..r3`
+3. `p5b_direct_seq_mem_r1..r3`
+4. `p5b_apim_retry_cb_r1..r3`
+5. `p5b_direct_weighted_mem_r1..r3`
+6. `p5b_apim_retry_cb_trip1_r1..r3`
+
+**Results (to be filled after runs):**
+
+| arm | r1 | r2 | r3 | median | p95_ms |
+|---|---|---|---|---|---|
+| `direct_seq` | — | — | — | — | — |
+| `direct_seq_mem` | — | — | — | — | — |
+| `direct_weighted_mem` | — | — | — | — | — |
+| `apim_retry_cb` | — | — | — | — | — |
+| `apim_retry_cb_trip1` | — | — | — | — | — |
+| `apim_priority` | — | — | — | — | — |
+
+---
+
+### Scenario C — Healthy baseline, 1 req/s (overhead measurement)
+
+All regions at 20 RPM each — well under the 72 RPM ceiling. No quota-driven failures.
+Expected success: 100% on both sides. The comparison measures pure gateway overhead.
+
+Reference: `car_baseline` (existing) — APIM, 1 req/s, equal weights, p50=374 ms, 100%.
+
+**Results (to be filled after runs):**
+
+| arm | type | r1_p50 | r2_p50 | r3_p50 | median_p50 |
+|---|---|---|---|---|---|
+| `p5c_apim_baseline` | APIM | — | — | — | — |
+| `p5c_direct_equal` | direct client | — | — | — | — |
+
+Overhead = median APIM p50 − median direct p50.
+
+---
+
+### Phase 5 findings
+
+*(To be written after all runs complete.)*
+

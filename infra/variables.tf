@@ -92,3 +92,12 @@ variable "apim_retry_interval_s" {
   type    = number
   default = 1
 }
+
+# Priority assigned to the two fallback backends (westeurope, swedencentral) in the pool.
+# 1 = same priority as UK South → weighted pool (all requests distributed by weight).
+# 2 = lower priority than UK South → priority pool (all requests go to UK South first;
+#     fallbacks only receive traffic when UK South's CB has tripped).
+variable "backend_priority_fallback" {
+  type    = number
+  default = 1
+}

@@ -3,12 +3,15 @@ import { check } from "k6";
 import { Counter, Trend } from "k6/metrics";
 
 // All configuration comes from environment variables — no values hardcoded.
-const DEPLOYMENT_ID = __ENV.DEPLOYMENT_ID  || "chat";
-const RUN_ID        = __ENV.RUN_ID         || "unnamed";
-const RATE_PER_S    = parseInt(__ENV.RATE_PER_S    || "2");
-const DURATION      = __ENV.DURATION               || "5m";
-const PRE_ALLOC_VUS = parseInt(__ENV.PRE_ALLOC_VUS || "30");
-const MAX_VUS       = parseInt(__ENV.MAX_VUS        || "60");
+const DEPLOYMENT_ID  = __ENV.DEPLOYMENT_ID  || "chat";
+const RUN_ID         = __ENV.RUN_ID         || "unnamed";
+const RATE_PER_S     = parseInt(__ENV.RATE_PER_S    || "2");
+const DURATION       = __ENV.DURATION               || "5m";
+const PRE_ALLOC_VUS  = parseInt(__ENV.PRE_ALLOC_VUS || "30");
+const MAX_VUS        = parseInt(__ENV.MAX_VUS        || "60");
+// When >0, skip any endpoint that returned 429 within this many seconds (per-VU).
+// Approximates a client-side CB memory. Set to 0 (default) for no memory.
+const MEMORY_SECONDS = parseInt(__ENV.MEMORY_SECONDS || "0");
 
 // Endpoints tried in order (sequential fallback: UK South → West Europe → Sweden Central).
 // Direct Foundry calls via API keys — no APIM.
@@ -41,6 +44,9 @@ const eventualSuccesses  = new Counter("eventual_successes");
 const totalHttpCalls     = new Counter("total_http_calls");
 const timeToSuccess      = new Trend("time_to_success", true);
 
+// VU-local per-region last-429 timestamp. Only consulted when MEMORY_SECONDS > 0.
+const last429 = {};
+
 const PAYLOAD = JSON.stringify({
   messages: [{ role: "user", content: "Reply with exactly one word: Hello." }],
   max_tokens: 5,
@@ -62,10 +68,18 @@ export default function () {
 
   // Sequential fallback: UK South first, then West Europe, then Sweden Central.
   // Moves to the next region on any non-200 response (429, 5xx, etc.).
+  // When MEMORY_SECONDS > 0, skips any region that returned 429 within that window (per-VU).
   for (const ep of ENDPOINTS) {
+    if (MEMORY_SECONDS > 0) {
+      const t = last429[ep.region];
+      if (t !== undefined && (Date.now() - t) < MEMORY_SECONDS * 1000) continue;
+    }
     const res = http.post(buildUrl(ep), PAYLOAD, { headers: buildHeaders(ep) });
     totalHttpCalls.add(1);
     finalRes = res;
+    if (res.status === 429 && MEMORY_SECONDS > 0) {
+      last429[ep.region] = Date.now();
+    }
     if (res.status === 200) {
       try {
         const body = JSON.parse(res.body);

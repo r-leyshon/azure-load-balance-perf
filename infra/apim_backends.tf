@@ -83,12 +83,12 @@ resource "azapi_resource" "foundry_pool" {
           },
           {
             id       = azurerm_api_management_backend.foundry["westeurope"].id
-            priority = 1
+            priority = var.backend_priority_fallback
             weight   = var.backend_weight_westeurope
           },
           {
             id       = azurerm_api_management_backend.foundry["swedencentral"].id
-            priority = 1
+            priority = var.backend_priority_fallback
             weight   = var.backend_weight_swedencentral
           }
         ]

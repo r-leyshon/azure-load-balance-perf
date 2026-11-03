@@ -151,6 +151,8 @@ run_car_experiment() {
   local cb429="${9:-true}"
   local apim_retry="${10:-0}"
   local apim_retry_s="${11:-1}"
+  # 1 = weighted pool (all same priority); 2 = priority pool (fallbacks at lower priority)
+  local priority_fallback="${12:-1}"
 
   echo ""
   echo "========================================"
@@ -170,6 +172,7 @@ run_car_experiment() {
     -var "backend_weight_swedencentral=$weight_sc" \
     -var "apim_retry_count=$apim_retry" \
     -var "apim_retry_interval_s=$apim_retry_s" \
+    -var "backend_priority_fallback=$priority_fallback" \
     | tail -5
 
   cd "$REPO_ROOT"
@@ -181,6 +184,57 @@ run_car_experiment() {
     -e RATE_PER_S="$rate_per_s" \
     -e DURATION="$duration" \
     experiment/car_test.js
+
+  echo "  Done: results written to experiment/results/${id}.json"
+}
+
+# ---------------------------------------------------------------------------
+# run_weighted_client_car_experiment  id  rate_per_s  duration  retry_mode
+#                                     memory_seconds  max_retries
+#                                     weight_uk  weight_we  weight_sc
+#
+# Calls weighted_client_car_test.js (Foundry API key auth, weighted random
+# selection, optional per-VU 429 memory, no APIM).  A 60s sleep is included
+# so that run order can be interleaved with APIM runs and quota resets cleanly.
+# ---------------------------------------------------------------------------
+run_weighted_client_car_experiment() {
+  local id="$1"
+  local rate_per_s="$2"
+  local duration="$3"
+  local retry_mode="$4"
+  local memory_seconds="$5"
+  local max_retries="$6"
+  local weight_uk="$7"
+  local weight_we="$8"
+  local weight_sc="$9"
+
+  echo ""
+  echo "========================================"
+  echo "  Weighted-client CAR experiment: $id"
+  echo "========================================"
+
+  echo "  Waiting 60s for quota window to clear..."
+  sleep 60
+
+  cd "$REPO_ROOT"
+  k6 run \
+    -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+    -e FOUNDRY_ENDPOINT_UKSOUTH="$FOUNDRY_ENDPOINT_UKSOUTH" \
+    -e FOUNDRY_KEY_UKSOUTH="$FOUNDRY_KEY_UKSOUTH" \
+    -e FOUNDRY_ENDPOINT_WESTEUROPE="$FOUNDRY_ENDPOINT_WESTEUROPE" \
+    -e FOUNDRY_KEY_WESTEUROPE="$FOUNDRY_KEY_WESTEUROPE" \
+    -e FOUNDRY_ENDPOINT_SWEDENCENTRAL="$FOUNDRY_ENDPOINT_SWEDENCENTRAL" \
+    -e FOUNDRY_KEY_SWEDENCENTRAL="$FOUNDRY_KEY_SWEDENCENTRAL" \
+    -e RUN_ID="$id" \
+    -e RATE_PER_S="$rate_per_s" \
+    -e DURATION="$duration" \
+    -e RETRY_MODE="$retry_mode" \
+    -e MEMORY_SECONDS="$memory_seconds" \
+    -e MAX_RETRIES="$max_retries" \
+    -e WEIGHT_UKSOUTH="$weight_uk" \
+    -e WEIGHT_WESTEUROPE="$weight_we" \
+    -e WEIGHT_SWEDENCENTRAL="$weight_sc" \
+    experiment/weighted_client_car_test.js
 
   echo "  Done: results written to experiment/results/${id}.json"
 }
@@ -201,6 +255,9 @@ run_direct_car_experiment() {
   echo "  Direct CAR experiment: $id"
   echo "========================================"
 
+  echo "  Waiting 60s for quota window to clear..."
+  sleep 60
+
   cd "$REPO_ROOT"
   k6 run \
     -e DEPLOYMENT_ID="$DEPLOYMENT_ID" \
@@ -213,6 +270,7 @@ run_direct_car_experiment() {
     -e RUN_ID="$id" \
     -e RATE_PER_S="$rate_per_s" \
     -e DURATION="$duration" \
+    -e MEMORY_SECONDS="${4:-0}" \
     experiment/direct_car_test.js
 
   echo "  Done: results written to experiment/results/${id}.json"
@@ -403,6 +461,119 @@ DIRECT_CAR_EXPERIMENTS["car_direct_spill_r2"]="2 5m"
 DIRECT_CAR_EXPERIMENTS["car_direct_spill_r3"]="2 5m"
 
 # ---------------------------------------------------------------------------
+# Phase 5 — Matched-pair APIM vs direct client comparison
+#
+# Goal: determine whether APIM produces better results than an equivalent client
+# when both face identical conditions (same quota, arrival rate, retry rules).
+#
+# Decision criterion (written 2026-11-03, before any Phase 5 runs):
+#   APIM adds measurable value if, for any matched pair across ≥3 repeats,
+#   the APIM median success rate exceeds the matched client by > 2 pp, OR the
+#   APIM median p95 latency is > 50 ms lower. If neither threshold is met,
+#   APIM's value is operational, not throughput.
+#
+# Scenario A: spill regime, 2 req/s, UK South saturated (108 RPM vs 72 ceiling).
+# Scenario B: near fallback limit, 3 req/s (UK South 162 RPM; fallbacks ~90 RPM each after trip).
+# Scenario C: healthy baseline, 1 req/s, all regions well under ceiling (overhead measurement).
+#
+# Run order is interleaved: client arm, then matched APIM arm, repeat.
+# All arms include a 60s gap (quota reset; also serves as CB expiry for APIM arms).
+# ---------------------------------------------------------------------------
+
+# Phase 5 — APIM additions to CAR_EXPERIMENTS
+# Format: "rate_per_s duration wt_uk wt_we wt_sc rpm cb cb429 apim_retry apim_retry_s [priority_fallback]"
+# Last field optional: 1 = weighted pool (default), 2 = priority pool (UK South first).
+
+# Scenario A — 2 req/s spill
+# apim_retry_no_cb: existing r1-r3 (car_retry_90_5_5[_r2][_r3], 68%), need r4-r5
+CAR_EXPERIMENTS["p5a_apim_retry_no_cb_r4"]="2 5m 90 5 5 10000 0 false 3 1"
+CAR_EXPERIMENTS["p5a_apim_retry_no_cb_r5"]="2 5m 90 5 5 10000 0 false 3 1"
+# apim_retry_cb: existing r1-r3 (car_retry_cb429_90_5_5[_r2][_r3], 96.5%), need r4-r5
+CAR_EXPERIMENTS["p5a_apim_retry_cb_r4"]="2 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["p5a_apim_retry_cb_r5"]="2 5m 90 5 5 10000 3 true 3 1"
+# apim_retry_cb_trip1: existing r1 (car_retry_cb429_90_5_5_trip1, 99.3%), need r2-r5
+CAR_EXPERIMENTS["p5a_apim_retry_cb_trip1_r2"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5a_apim_retry_cb_trip1_r3"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5a_apim_retry_cb_trip1_r4"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5a_apim_retry_cb_trip1_r5"]="2 5m 90 5 5 10000 1 true 3 1"
+# apim_priority: UK South priority=1, WE/SC priority=2, CB trip=1, retry=3. New arm.
+# WE/SC weights 5/5 = 50/50 split when UK South trips. UK South weight irrelevant at priority=1.
+CAR_EXPERIMENTS["p5a_apim_priority_r1"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5a_apim_priority_r2"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5a_apim_priority_r3"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5a_apim_priority_r4"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5a_apim_priority_r5"]="2 5m 90 5 5 10000 1 true 3 1 2"
+
+# Scenario B — 3 req/s (UK South 162 RPM, fallbacks ~90 RPM each after trip)
+CAR_EXPERIMENTS["p5b_apim_retry_cb_r1"]="3 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_retry_cb_r2"]="3 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_retry_cb_r3"]="3 5m 90 5 5 10000 3 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_retry_cb_trip1_r1"]="3 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_retry_cb_trip1_r2"]="3 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_retry_cb_trip1_r3"]="3 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5b_apim_priority_r1"]="3 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5b_apim_priority_r2"]="3 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5b_apim_priority_r3"]="3 5m 90 5 5 10000 1 true 3 1 2"
+
+# Scenario C — 1 req/s healthy (overhead measurement, equal weights, no failures)
+CAR_EXPERIMENTS["p5c_apim_baseline_r1"]="1 5m 33 33 34 10000 0 true 0 1"
+CAR_EXPERIMENTS["p5c_apim_baseline_r2"]="1 5m 33 33 34 10000 0 true 0 1"
+CAR_EXPERIMENTS["p5c_apim_baseline_r3"]="1 5m 33 33 34 10000 0 true 0 1"
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Direct CAR additions (sequential fallback with memory)
+# Format: "rate_per_s duration [memory_seconds]"   (4th field = MEMORY_SECONDS)
+# ---------------------------------------------------------------------------
+
+# direct_seq (no memory): existing r1-r3 (car_direct_spill[_r2][_r3], 100%), need r4-r5
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_r4"]="2 5m 0"
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_r5"]="2 5m 0"
+# direct_seq_mem (60s memory): new arm, 5 runs
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_mem_r1"]="2 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_mem_r2"]="2 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_mem_r3"]="2 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_mem_r4"]="2 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5a_direct_seq_mem_r5"]="2 5m 60"
+# Scenario B (3 req/s)
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_r1"]="3 5m 0"
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_r2"]="3 5m 0"
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_r3"]="3 5m 0"
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_mem_r1"]="3 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_mem_r2"]="3 5m 60"
+DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_mem_r3"]="3 5m 60"
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Weighted-client CAR experiments
+# Format: "rate_per_s duration retry_mode memory_seconds max_retries wt_uk wt_we wt_sc"
+# ---------------------------------------------------------------------------
+
+declare -A WEIGHTED_CLIENT_EXPERIMENTS
+
+# Scenario A — 2 req/s spill, 90/5/5
+# Weighted, no memory (matches APIM retry_no_cb: re-enters full pool on retry)
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_r1"]="2 5m weighted 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_r2"]="2 5m weighted 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_r3"]="2 5m weighted 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_r4"]="2 5m weighted 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_r5"]="2 5m weighted 60 3 90 5 5"
+# Weighted, 60s memory (matches APIM retry_cb: retries avoid 429-flagged regions)
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_mem_r1"]="2 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_mem_r2"]="2 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_mem_r3"]="2 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_mem_r4"]="2 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5a_direct_weighted_mem_r5"]="2 5m memory 60 3 90 5 5"
+
+# Scenario B — 3 req/s
+WEIGHTED_CLIENT_EXPERIMENTS["p5b_direct_weighted_mem_r1"]="3 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5b_direct_weighted_mem_r2"]="3 5m memory 60 3 90 5 5"
+WEIGHTED_CLIENT_EXPERIMENTS["p5b_direct_weighted_mem_r3"]="3 5m memory 60 3 90 5 5"
+
+# Scenario C — 1 req/s healthy, equal weights
+WEIGHTED_CLIENT_EXPERIMENTS["p5c_direct_equal_r1"]="1 5m weighted 60 3 33 33 34"
+WEIGHTED_CLIENT_EXPERIMENTS["p5c_direct_equal_r2"]="1 5m weighted 60 3 33 33 34"
+WEIGHTED_CLIENT_EXPERIMENTS["p5c_direct_equal_r3"]="1 5m weighted 60 3 33 33 34"
+
+# ---------------------------------------------------------------------------
 # Direct experiment definitions
 # Format: "vus iter mode wt_uk wt_we wt_sc"
 # ---------------------------------------------------------------------------
@@ -454,9 +625,9 @@ fi
 for id in $ORDERED; do
   if [ -n "${CAR_EXPERIMENTS[$id]+_}" ]; then
     args="${CAR_EXPERIMENTS[$id]}"
-    read -r rate_per_s duration wuk wwe wsc rpm cb cb429 apim_retry apim_retry_s <<< "$args"
+    read -r rate_per_s duration wuk wwe wsc rpm cb cb429 apim_retry apim_retry_s priority_fallback <<< "$args"
     run_car_experiment "$id" "$rate_per_s" "$duration" "$wuk" "$wwe" "$wsc" "$rpm" "$cb" \
-      "$cb429" "$apim_retry" "$apim_retry_s"
+      "$cb429" "$apim_retry" "$apim_retry_s" "${priority_fallback:-1}"
 
     # Calibration gate: after car_baseline, verify ≥95% success before running spill arms.
     if [ "$id" = "car_baseline" ]; then
@@ -478,10 +649,15 @@ print(round(succ / orig * 100, 1))
       fi
     fi
 
+  elif [ -n "${WEIGHTED_CLIENT_EXPERIMENTS[$id]+_}" ]; then
+    args="${WEIGHTED_CLIENT_EXPERIMENTS[$id]}"
+    read -r rate_per_s duration retry_mode memory_seconds max_retries wuk wwe wsc <<< "$args"
+    run_weighted_client_car_experiment "$id" "$rate_per_s" "$duration" "$retry_mode" \
+      "$memory_seconds" "$max_retries" "$wuk" "$wwe" "$wsc"
   elif [ -n "${DIRECT_CAR_EXPERIMENTS[$id]+_}" ]; then
     args="${DIRECT_CAR_EXPERIMENTS[$id]}"
-    read -r rate_per_s duration <<< "$args"
-    run_direct_car_experiment "$id" "$rate_per_s" "$duration"
+    read -r rate_per_s duration memory_seconds <<< "$args"
+    run_direct_car_experiment "$id" "$rate_per_s" "$duration" "${memory_seconds:-0}"
   elif [ -n "${ADAPTIVE_EXPERIMENTS[$id]+_}" ]; then
     args="${ADAPTIVE_EXPERIMENTS[$id]}"
     read -r vus iter adapt_s penalty epsilon <<< "$args"
