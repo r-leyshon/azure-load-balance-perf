@@ -132,6 +132,28 @@ run_direct_experiment() {
 }
 
 # ---------------------------------------------------------------------------
+# readback_config  id
+# Reads the applied pool priorities/weights and per-backend CB rules from ARM and
+# writes experiment/results/<id>.config.json, so each APIM run records what was
+# actually applied rather than what was requested.
+# ---------------------------------------------------------------------------
+readback_config() {
+  local id="$1"
+  local sub base
+  sub=$(az account show --query id -o tsv)
+  base="https://management.azure.com/subscriptions/$sub/resourceGroups/rg-apim-foundry-perf/providers/Microsoft.ApiManagement/service/apim-foundry-800a952e/backends"
+  {
+    az rest --method get --url "$base/foundry-pool?api-version=2023-09-01-preview" \
+      --query "{pool:properties.pool.services[].{b:id,priority:priority,weight:weight}}" -o json
+    for r in uksouth westeurope swedencentral; do
+      az rest --method get --url "$base/foundry-$r?api-version=2023-09-01-preview" \
+        --query "{backend:'$r',cb:properties.circuitBreaker.rules[0].failureCondition}" -o json
+    done
+  } | sed "s#/subscriptions/[^/]*/#/subscriptions/<sub>/#" > "$REPO_ROOT/experiment/results/${id}.config.json"
+  echo "  Config read-back written to experiment/results/${id}.config.json"
+}
+
+# ---------------------------------------------------------------------------
 # run_car_experiment  id  rate_per_s  duration  wt_uk  wt_we  wt_sc  rpm  cb  cb429
 #                     apim_retry  apim_retry_s
 #
@@ -174,6 +196,8 @@ run_car_experiment() {
     -var "apim_retry_interval_s=$apim_retry_s" \
     -var "backend_priority_fallback=$priority_fallback" \
     | tail -5
+
+  readback_config "$id"
 
   cd "$REPO_ROOT"
   k6 run \
@@ -503,6 +527,14 @@ CAR_EXPERIMENTS["p5a_apim_priority_r2"]="2 5m 90 5 5 10000 1 true 3 1 2"
 CAR_EXPERIMENTS["p5a_apim_priority_r3"]="2 5m 90 5 5 10000 1 true 3 1 2"
 CAR_EXPERIMENTS["p5a_apim_priority_r4"]="2 5m 90 5 5 10000 1 true 3 1 2"
 CAR_EXPERIMENTS["p5a_apim_priority_r5"]="2 5m 90 5 5 10000 1 true 3 1 2"
+
+# Verified re-runs (config read back from ARM into <id>.config.json), 2 req/s spill
+CAR_EXPERIMENTS["p5v_apim_priority_r1"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5v_apim_priority_r2"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5v_apim_priority_r3"]="2 5m 90 5 5 10000 1 true 3 1 2"
+CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r1"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r2"]="2 5m 90 5 5 10000 1 true 3 1"
+CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r3"]="2 5m 90 5 5 10000 1 true 3 1"
 
 # Scenario B — 3 req/s (UK South 162 RPM, fallbacks ~90 RPM each after trip)
 CAR_EXPERIMENTS["p5b_apim_retry_cb_r1"]="3 5m 90 5 5 10000 3 true 3 1"

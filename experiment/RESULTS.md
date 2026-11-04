@@ -798,20 +798,20 @@ WE and SC offered: 5% × 2 req/s = 6 RPM each — well under ceiling.
 7. `p5a_apim_retry_no_cb_r4` / `_r5`  (2 more to reach n=5)
 8. `p5a_direct_weighted_mem_r1` … `_r5`  (new weighted client, 60s memory, n=5)
 
-**Results (to be filled after runs):**
+**Results (2026-11-03, all n=5):**
 
-| arm | r1 | r2 | r3 | r4 | r5 | median | p95_ms |
-|---|---|---|---|---|---|---|---|
-| `direct_seq` | 100.0 | 100.0 | 100.0 | — | — | — | — |
-| `direct_seq_mem` | — | — | — | — | — | — | — |
-| `direct_weighted` | — | — | — | — | — | — | — |
-| `direct_weighted_mem` | — | — | — | — | — | — | — |
-| `apim_retry_no_cb` | 68.2 | 68.2 | 69.1 | — | — | — | — |
-| `apim_retry_cb` | 98.0 | 98.0 | 93.5 | — | — | — | — |
-| `apim_retry_cb_trip1` | 99.3 | — | — | — | — | — | — |
-| `apim_priority` | — | — | — | — | — | — | — |
+| arm | type | r1 | r2 | r3 | r4 | r5 | median | p50_succ_ms |
+|---|---|---|---|---|---|---|---|---|
+| `direct_seq` | client | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | **100.0%** | 372 |
+| `direct_seq_mem` | client | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | **100.0%** | 354 |
+| `direct_weighted_mem` | client | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | **100.0%** | 350 |
+| `apim_priority` | APIM | 99.3 | 99.3 | 99.3 | 99.3 | 99.2 | **99.3%** | 339 |
+| `apim_retry_cb_trip1` | APIM | 99.3 | 99.3 | 99.3 | 99.3 | 99.3 | **99.3%** | 366 |
+| `apim_retry_cb` | APIM | 98.0 | 98.0 | 93.5 | 98.0 | 98.0 | **98.0%** | 350 |
+| `direct_weighted` | client | 79.7 | 81.9 | 78.5 | 77.9 | 78.4 | **78.5%** | 432 |
+| `apim_retry_no_cb` | APIM | 68.2 | 68.2 | 69.1 | 68.7 | 69.3 | **68.7%** | 363 |
 
-*r1–r3 for direct_seq = car_direct_spill[_r2][_r3]. r1–r3 for apim_retry_no_cb = car_retry_90_5_5[_r2][_r3]. r1–r3 for apim_retry_cb = car_retry_cb429_90_5_5[_r2][_r3]. r1 for apim_retry_cb_trip1 = car_retry_cb429_90_5_5_trip1.*
+*r1–r3 for `direct_seq` = car_direct_spill[_r2][_r3]. r1–r3 for `apim_retry_no_cb` = car_retry_90_5_5[_r2][_r3]. r1–r3 for `apim_retry_cb` = car_retry_cb429_90_5_5[_r2][_r3]. r1 for `apim_retry_cb_trip1` = car_retry_cb429_90_5_5_trip1.*
 
 ---
 
@@ -860,7 +860,134 @@ Overhead = median APIM p50 − median direct p50.
 
 ---
 
+### Scenario A findings (2026-11-03)
+
+**Decision criterion: NOT MET.** In no matched pair does APIM exceed the matched client by more
+than 2 percentage points. In most pairs the client equals or surpasses APIM.
+
+**Matched-pair verdicts:**
+
+| Matched pair | Client median | APIM median | Gap | Criterion (> 2 pp for APIM) |
+|---|---|---|---|---|
+| `direct_seq` vs `apim_priority` | 100.0% | 99.3% | −0.7 pp | ✗ client wins |
+| `direct_seq_mem` vs `apim_priority` | 100.0% | 99.3% | −0.7 pp | ✗ client wins |
+| `direct_weighted_mem` vs `apim_retry_cb` | 100.0% | 98.0% | −2.0 pp | ✗ client wins |
+| `direct_weighted_mem` vs `apim_retry_cb_trip1` | 100.0% | 99.3% | −0.7 pp | ✗ client wins |
+| `direct_weighted` vs `apim_retry_no_cb` | 78.5% | 68.7% | −9.8 pp | ✗ client wins |
+
+**Finding 1 — Per-VU client memory (100%) outperforms APIM's global CB+retry (98.0–99.3%).**
+`direct_weighted_mem` achieves 100.0% across all 5 runs with essentially zero variance. Its
+matched APIM arms peak at 98.0–99.3% with r3 of `apim_retry_cb` dipping to 93.5%. The mechanism:
+per-VU memory blocks a region after the first 429 that VU personally observes. Each VU reacts
+independently and immediately to its own first quota failure. APIM's global CB requires 3
+cumulative failures across all traffic before UK South is removed from the pool, which allows
+more 429 losses during the ramp-up window. Per-VU is faster to trip; global CB trips once and
+covers all VUs simultaneously, but that first-trip window causes more losses than per-VU early
+reaction.
+
+The per-region counters confirm the mechanism: in `direct_weighted_mem` runs, UK South received
+~401 calls per 601 iterations (67% of calls), down from 90% — VUs shift away from UK South as
+their personal 429 memory accumulates. WE and SC each received ~120 calls (20% each).
+
+**Finding 2 — Client "weighted with replacement" (78.5%) inverts APIM retry without CB (68.7%).**
+Both implementations re-enter the full 90/5/5 weighted pool on each retry attempt, yet the client
+achieves 9.8 pp higher success across n=5. The most likely explanation: APIM retry is configured
+with a 1-second interval between attempts (`apim_retry_interval_s=1`). During that 1-second wait,
+the saturated UK South quota window does not reset, so the retry lands in the same depleted state.
+The client retries immediately (no wait), producing the same saturation state but without consuming
+the retry-window time. The per-region data for `direct_weighted` shows uk=973–1097 calls out of
+~1100 total (89% UK rate) confirming true "with replacement" behaviour — the same pool is
+re-entered uniformly.
+
+This inversion means: **an unguided retry with no memory is significantly more effective as a
+direct client than as an APIM retry policy**, purely due to the APIM retry interval. Setting
+`apim_retry_interval_s=0` or removing the delay may close this gap; it has not been tested.
+
+**Finding 3 — APIM priority pool (99.3%) is equivalent to APIM CB trip=1 (99.3%), both 5/5.**
+The priority pool correctly routes all traffic to UK South first (priority=1); when UK South's CB
+trips on the first failure, retries are forced to WE/SC (priority=2). The result is
+indistinguishable from the CB trip=1 weighted pool. Both achieve 99.2–99.3% with extremely low
+variance. These are operationally different configurations (explicit priority vs weighted+CB) that
+produce the same throughput outcome.
+
+**Finding 4 — Sequential client with memory (`direct_seq_mem`) matches `direct_seq` on success
+(both 100%) but makes far fewer wasted calls.** `direct_seq` overhead = 0.40 extra calls per success
+(always pays the UK South wasted call). `direct_seq_mem` overhead = 0.10 (once a VU has seen a UK
+South 429, it skips UK South for 60s, avoiding the wasted call on subsequent iterations). Both hit
+100.0% but `direct_seq_mem` is more efficient per-request.
+
+### Scenario B results — 3 req/s (2026-11-04, n=3 per arm)
+
+| arm | type | success % (r1/r2/r3) | median | tts p50 ms | tts p95 ms | extra calls/success |
+|---|---|---|---|---|---|---|
+| `direct_seq` | client | 100.0 / 100.0 / 100.0 | 100.0 | 476–498 | 795–850 | 0.83 |
+| `direct_seq_mem` | client | 100.0 / 100.0 / 99.9 | 100.0 | 344–351 | 674–790 | 0.13–0.14 |
+| `direct_weighted_mem` | client | 100.0 / 100.0 / 100.0 | 100.0 | 339–344 | 546–631 | 0.09 |
+| `apim_priority` | APIM | 99.3 / 99.3 / 95.7 | 99.3 | 343–364 | 772–864 | n/a ¹ |
+| `apim_retry_cb` | APIM | 98.0 / 98.0 / 98.0 | 98.0 | 340–361 | 918–1010 | n/a ¹ |
+| `apim_retry_cb_trip1` | APIM | 99.3 / 99.3 / 99.3 | 99.3 | 340–362 | 830–846 | n/a ¹ |
+
+¹ k6 sees one call per request to APIM; APIM's internal retries to Foundry are not visible, so
+extra-call cost cannot be compared for gateway arms.
+
+Not run at B: `direct_weighted` and `apim_retry_no_cb` (already known to fail at A).
+
+### Scenario C results — 1 req/s healthy (n=3 per arm)
+
+| arm | success % | tts p50 ms (r1/r2/r3) | tts p95 ms (r1/r2/r3) |
+|---|---|---|---|
+| `p5c_apim_baseline` | 100 / 100 / 100 | 371 / 389 / 372 | 710 / 893 / 673 |
+| `p5c_direct_equal` | 100 / 100 / 100 | 374 / 400 / 396 | 572 / 597 / 593 |
+
+Median-of-run-medians: APIM 372 ms vs direct 396 ms, so **no p50 gateway overhead is visible**.
+The earlier "25–65 ms" gap does not reproduce. APIM's p95 is ~100–300 ms higher (673–893 vs
+572–597 ms); with n=3 this is suggestive of a heavier tail, not established.
+
+### Scenario B/C findings
+
+- **Tripping on the first failure is safe at 3 req/s.** `apim_retry_cb_trip1` held 99.3% in all
+  three runs, so the open question about trip=1 near fallback limits is answered for this load.
+- **Client memory remains at or above APIM.** Every client arm with memory scored ≥99.9%; APIM
+  arms scored 95.7–99.3%. `apim_priority` r3 dipped to 95.7%, cause not investigated.
+- **Cost of failing over differs sharply:** `direct_seq` (no memory) pays 0.83 extra calls per
+  success at 3 req/s (tts p50 ~480 ms); memory cuts that to ~0.1 and restores ~345 ms.
+  Gateway-arm call cost is not measurable from k6 (see note ¹ under the B table).
+
+### Verified re-runs: `apim_priority` vs `apim_retry_cb_trip1` (2 req/s, 2026-11-04)
+
+Config read back from ARM after each apply (`<run_id>.config.json`): `apim_priority` runs show
+pool priorities 1/2/2, weights 90/5/5, CB count 1 on 429+5xx; `trip1` runs show priorities 1/1/1,
+same weights and CB. Interleaved, 60 s gaps, 0 dropped iterations.
+
+| arm | success % (r1/r2/r3) | tts p50 ms | tts p95 ms |
+|---|---|---|---|
+| `apim_priority` | 99.3 / 99.3 / 99.2 | 361–384 | 1179–1435 |
+| `apim_retry_cb_trip1` | 99.3 / 99.3 / 99.3 | 375–394 | 1308–1604 |
+
+The two are equivalent on success; priority is slightly lower on latency (p95 ~130–170 ms) but
+n=3 and the ranges overlap, so not established. This confirms the earlier equivalence was real,
+not a failure to apply the priority setting. (p95 here is higher than in the earlier A/B runs;
+APIM p95 varied between batches, so compare within a batch only.) The runner now records a
+config read-back for every APIM run. Raw result and config JSONs remain git-ignored
+(`experiment/results/`), per the repo's security rules.
+
 ### Phase 5 findings
 
-*(To be written after all runs complete.)*
+**Decision rule result: "APIM buys something" is NOT met.** Across Scenario A and B no APIM arm
+exceeded the best matched client arm by more than 2 pp, and APIM p95 was never clearly lower
+(it was higher in B and C). On these measurements APIM's case is operational, not performance.
+
+Caveats that limit this conclusion:
+- **Client memory is per-VU, not shared.** This is a different (and here more effective)
+  mechanism from APIM's global breaker; it is not a like-for-like of the same rule. A single
+  shared client process would behave differently from many independent VUs.
+- **The 9.8 pp gap between `direct_weighted` and `apim_retry_no_cb` is unexplained.** The
+  1 s APIM retry interval is a hypothesis; `apim_retry_interval_s=0` was not tested. The
+  interval actually used was 1 s (recorded, not controlled to match the client's 0 s).
+- **Applied APIM config was not read back for the original A/B/C runs** (only that
+  `terraform apply` succeeded). The verified re-runs below close this for `apim_priority`.
+- **Not done:** per-region call counts for APIM arms (needs APIM logs / Azure Monitor); the
+  portal quota figure and full 429 body (B6); Scenario D (all regions short); the strict
+  ≥60 s gap was met via the 60 s sleep, but raw result JSONs are git-ignored and not committed.
+- Non-performance reasons for a gateway (credentials, central policy, monitoring) are untouched.
 
