@@ -16,6 +16,30 @@ INFRA_DIR="$REPO_ROOT/infra"
 
 source "$INFRA_DIR/.env"
 
+# Run a command up to 3 times (RETRY_PAUSE_S apart, default 30). Each attempt is killed after
+# WATCHDOG_S (default 900): the Azure CLI token fetch can block forever on a dead connection
+# (read timeout=None, e.g. after the laptop sleeps), which a plain retry cannot recover from.
+# A persistent failure (e.g. expired PIM) still fails after the 3rd attempt.
+retry3() {
+  local n rc pid wd
+  for n in 1 2 3; do
+    "$@" &
+    pid=$!
+    # The watchdog must not inherit our stdout: callers pipe us through `tail`, and an orphaned
+    # `sleep` holding the pipe open would make `tail` wait for the whole watchdog period.
+    ( sleep "${WATCHDOG_S:-900}"
+      echo "  watchdog: attempt exceeded ${WATCHDOG_S:-900}s, killing" >&2
+      kill -TERM "$pid" 2>/dev/null; sleep 5; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null &
+    wd=$!
+    rc=0; wait "$pid" || rc=$?
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null || true
+    [ "$rc" -eq 0 ] && return 0
+    echo "  attempt $n failed (rc=$rc); retrying in ${RETRY_PAUSE_S:-30}s..." >&2
+    sleep "${RETRY_PAUSE_S:-30}"
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # run_experiment  id  vus  iter  wt_uk  wt_we  wt_sc  rpm  cb  cb429
 #                 apim_retry  apim_retry_s  retry_strategy  max_retries  retry_delay_ms
@@ -50,7 +74,7 @@ run_experiment() {
   sleep 60
 
   cd "$INFRA_DIR"
-  terraform apply -auto-approve \
+  retry3 terraform apply -auto-approve \
     -var "gateway_rpm_limit=$rpm" \
     -var "circuit_breaker_failure_count=$cb" \
     -var "circuit_breaker_on_429=$cb429" \
@@ -139,9 +163,14 @@ run_direct_experiment() {
 # ---------------------------------------------------------------------------
 readback_config() {
   local id="$1"
-  local sub base
-  sub=$(az account show --query id -o tsv)
-  base="https://management.azure.com/subscriptions/$sub/resourceGroups/rg-apim-foundry-perf/providers/Microsoft.ApiManagement/service/apim-foundry-800a952e/backends"
+  local sub base apim_name
+  # Project subscription from the git-ignored tfvars, not the CLI default (which can change).
+  sub=$(sed -nE 's/^subscription_id[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$INFRA_DIR/terraform.tfvars")
+  [ -n "$sub" ] || { echo "subscription_id not found in terraform.tfvars" >&2; return 1; }
+  # APIM service name = first label of the gateway host in the git-ignored .env.
+  apim_name="${APIM_GATEWAY_URL#*://}"; apim_name="${apim_name%%.*}"
+  [ -n "$apim_name" ] || { echo "cannot derive APIM name from APIM_GATEWAY_URL" >&2; return 1; }
+  base="https://management.azure.com/subscriptions/$sub/resourceGroups/rg-apim-foundry-perf/providers/Microsoft.ApiManagement/service/$apim_name/backends"
   {
     az rest --method get --url "$base/foundry-pool?api-version=2023-09-01-preview" \
       --query "{pool:properties.pool.services[].{b:id,priority:priority,weight:weight}}" -o json
@@ -149,6 +178,9 @@ readback_config() {
       az rest --method get --url "$base/foundry-$r?api-version=2023-09-01-preview" \
         --query "{backend:'$r',cb:properties.circuitBreaker.rules[0].failureCondition}" -o json
     done
+    printf '{"retry_policy":"%s"}\n' "$(az rest --method get \
+      --url "https://management.azure.com/subscriptions/$sub/resourceGroups/rg-apim-foundry-perf/providers/Microsoft.ApiManagement/service/$apim_name/apis/foundry-chat/policies/policy?api-version=2023-09-01-preview&format=rawxml" \
+      --query properties.value -o tsv 2>/dev/null | tr -d '\n\t' | grep -o '<retry[^>]*>')"
   } | sed "s#/subscriptions/[^/]*/#/subscriptions/<sub>/#" > "$REPO_ROOT/experiment/results/${id}.config.json"
   echo "  Config read-back written to experiment/results/${id}.config.json"
 }
@@ -181,11 +213,11 @@ run_car_experiment() {
   echo "  CAR experiment: $id"
   echo "========================================"
 
-  echo "  Waiting 60s for CB state to clear..."
-  sleep 60
+  echo "  Brief pause before apply (CB expiry is covered by the post-apply settle)..."
+  sleep 10
 
   cd "$INFRA_DIR"
-  terraform apply -auto-approve \
+  retry3 terraform apply -auto-approve \
     -var "gateway_rpm_limit=$rpm" \
     -var "circuit_breaker_failure_count=$cb" \
     -var "circuit_breaker_on_429=$cb429" \
@@ -197,7 +229,12 @@ run_car_experiment() {
     -var "backend_priority_fallback=$priority_fallback" \
     | tail -5
 
-  readback_config "$id"
+  retry3 readback_config "$id"
+
+  # The APIM gateway takes up to ~2 min to pick up a changed policy (observed: a request
+  # 25 s after apply still ran the previous policy). Wait before generating load.
+  echo "  Settling 120s for gateway to pick up the applied config..."
+  sleep 120
 
   cd "$REPO_ROOT"
   k6 run \
@@ -536,6 +573,47 @@ CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r1"]="2 5m 90 5 5 10000 1 true 3 1"
 CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r2"]="2 5m 90 5 5 10000 1 true 3 1"
 CAR_EXPERIMENTS["p5v_apim_retry_cb_trip1_r3"]="2 5m 90 5 5 10000 1 true 3 1"
 
+# p5r: region-accounting runs (isolated by the driver with extra idle time; see
+# scripts/foundry_region_counts.py). 2 req/s spill.
+for i in 1 2; do
+  CAR_EXPERIMENTS["p5r_apim_priority_r$i"]="2 5m 90 5 5 10000 1 true 3 1 2"
+  CAR_EXPERIMENTS["p5r_apim_retry_cb_trip1_r$i"]="2 5m 90 5 5 10000 1 true 3 1"
+  CAR_EXPERIMENTS["p5r_apim_retry_cb_r$i"]="2 5m 90 5 5 10000 3 true 3 1"
+  CAR_EXPERIMENTS["p5r_apim_retry_no_cb_r$i"]="2 5m 90 5 5 10000 0 false 3 1"
+done
+
+# p5i: APIM retry interval test (does the 1 s wait explain direct_weighted 78.5% vs APIM 68.7%?)
+for i in 1 2 3; do
+  CAR_EXPERIMENTS["p5i_apim_retry_no_cb_int0_r$i"]="2 5m 90 5 5 10000 0 false 3 0"
+  CAR_EXPERIMENTS["p5i_apim_retry_no_cb_int1_r$i"]="2 5m 90 5 5 10000 0 false 3 1"
+  CAR_EXPERIMENTS["p5i_apim_retry_cb_int0_r$i"]="2 5m 90 5 5 10000 3 true 3 0"
+done
+
+# p5d: every region short (6 req/s = ~1.7x the ~3.6 req/s three-region ceiling)
+for i in 1 2 3; do
+  CAR_EXPERIMENTS["p5d_apim_priority_r$i"]="6 5m 90 5 5 10000 1 true 3 1 2"
+  CAR_EXPERIMENTS["p5d_apim_retry_cb_trip1_eq_r$i"]="6 5m 33 33 34 10000 1 true 3 1"
+done
+
+# p6: runs with the FIXED retry policy (buffer-request-body="true"). Before this fix APIM
+# retries never reached Foundry (body consumed -> "Content length mismatch"), so all earlier
+# "APIM retry" arms were effectively no-retry. apim_retry=2 means 1 + 2 = 3 total attempts,
+# matching the client arms' MAX_RETRIES=3.
+for i in 1 2 3 4 5; do
+  CAR_EXPERIMENTS["p6a_apim_retry_no_cb_r$i"]="2 5m 90 5 5 10000 0 false 2 1"
+  CAR_EXPERIMENTS["p6a_apim_retry_cb_r$i"]="2 5m 90 5 5 10000 3 true 2 1"
+  CAR_EXPERIMENTS["p6a_apim_retry_cb_trip1_r$i"]="2 5m 90 5 5 10000 1 true 2 1"
+  CAR_EXPERIMENTS["p6a_apim_priority_r$i"]="2 5m 90 5 5 10000 1 true 2 1 2"
+done
+for i in 1 2 3; do
+  CAR_EXPERIMENTS["p6a_apim_retry_no_cb_int0_r$i"]="2 5m 90 5 5 10000 0 false 2 0"
+  CAR_EXPERIMENTS["p6b_apim_retry_cb_r$i"]="3 5m 90 5 5 10000 3 true 2 1"
+  CAR_EXPERIMENTS["p6b_apim_retry_cb_trip1_r$i"]="3 5m 90 5 5 10000 1 true 2 1"
+  CAR_EXPERIMENTS["p6b_apim_priority_r$i"]="3 5m 90 5 5 10000 1 true 2 1 2"
+  CAR_EXPERIMENTS["p6d_apim_priority_r$i"]="6 5m 90 5 5 10000 1 true 2 1 2"
+  CAR_EXPERIMENTS["p6d_apim_retry_cb_trip1_eq_r$i"]="6 5m 33 33 34 10000 1 true 2 1"
+done
+
 # Scenario B — 3 req/s (UK South 162 RPM, fallbacks ~90 RPM each after trip)
 CAR_EXPERIMENTS["p5b_apim_retry_cb_r1"]="3 5m 90 5 5 10000 3 true 3 1"
 CAR_EXPERIMENTS["p5b_apim_retry_cb_r2"]="3 5m 90 5 5 10000 3 true 3 1"
@@ -580,6 +658,28 @@ DIRECT_CAR_EXPERIMENTS["p5b_direct_seq_mem_r3"]="3 5m 60"
 # ---------------------------------------------------------------------------
 
 declare -A WEIGHTED_CLIENT_EXPERIMENTS
+
+# p6r: isolated region-accounting runs with the fixed policy (driver adds idle time around them)
+CAR_EXPERIMENTS["p6r_apim_retry_no_cb_r1"]="2 5m 90 5 5 10000 0 false 2 1"
+CAR_EXPERIMENTS["p6r_apim_retry_cb_r1"]="2 5m 90 5 5 10000 3 true 2 1"
+CAR_EXPERIMENTS["p6r_apim_retry_cb_trip1_r1"]="2 5m 90 5 5 10000 1 true 2 1"
+CAR_EXPERIMENTS["p6r_apim_priority_r1"]="2 5m 90 5 5 10000 1 true 2 1 2"
+
+# p6 interleaved client arms (re-run alongside the fixed-policy APIM arms)
+for i in 1 2 3 4 5; do
+  WEIGHTED_CLIENT_EXPERIMENTS["p6a_direct_weighted_mem_r$i"]="2 5m memory 60 3 90 5 5"
+  DIRECT_CAR_EXPERIMENTS["p6a_direct_seq_mem_r$i"]="2 5m 60"
+done
+for i in 1 2 3; do
+  WEIGHTED_CLIENT_EXPERIMENTS["p6a_direct_weighted_r$i"]="2 5m weighted 60 3 90 5 5"
+done
+
+WEIGHTED_CLIENT_EXPERIMENTS["p5r_direct_weighted_mem_r1"]="2 5m memory 60 3 90 5 5"
+for i in 1 2 3; do
+  WEIGHTED_CLIENT_EXPERIMENTS["p5i_direct_weighted_r$i"]="2 5m weighted 60 3 90 5 5"
+  WEIGHTED_CLIENT_EXPERIMENTS["p5d_direct_weighted_mem_eq_r$i"]="6 5m memory 60 3 33 33 34"
+  DIRECT_CAR_EXPERIMENTS["p5d_direct_seq_mem_r$i"]="6 5m 60"
+done
 
 # Scenario A — 2 req/s spill, 90/5/5
 # Weighted, no memory (matches APIM retry_no_cb: re-enters full pool on retry)

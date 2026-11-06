@@ -94,12 +94,15 @@ export default function () {
     timeToSuccess.add(Date.now() - startMs);
   }
 
-  check(finalRes, {
-    "http 200 ok":        (r) => r.status === 200,
-    "body has choices":   () => finalRes.status !== 200 || bodyValid,
-    "http 429 throttled": (r) => r.status === 429,
-    "no server error":    (r) => r.status < 500,
-  });
+  // finalRes is undefined when every region was in cooldown and no call was made.
+  if (finalRes) {
+    check(finalRes, {
+      "http 200 ok":        (r) => r.status === 200,
+      "body has choices":   () => finalRes.status !== 200 || bodyValid,
+      "http 429 throttled": (r) => r.status === 429,
+      "no server error":    (r) => r.status < 500,
+    });
+  }
 }
 
 export function handleSummary(data) {
