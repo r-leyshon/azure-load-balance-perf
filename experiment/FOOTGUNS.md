@@ -199,6 +199,35 @@ it can mislead a conclusion. Status of affected results is noted where relevant.
 - Redirect the watchdog's stdout to `/dev/null`. Test any wrapper by piping it through `tail`,
   not just by calling it directly.
 
+### 38. A newly created APIM instance can break the Terraform provider's read (405)
+- Rebuilding on 2026-11-09, `azurerm_api_management` was created (30 min) but every refresh then
+  failed with `405 MethodNotAllowed: Direct management API is disabled for this service`
+  ("retrieving tenant access properties"). The provider treats that as fatal, so the resource was
+  marked tainted and every later plan/apply failed at the same read (and a retry loop just repeats
+  it six times). Left alone, a taint means a 30-minute destroy and recreate that fails again.
+- **Workaround used:** `terraform untaint azurerm_api_management.apim`, then apply with
+  `-refresh=false` (also for destroy). This avoids enabling the direct management API, which would
+  widen the service's management surface.
+- Do not blind-retry a failing apply more than once or twice; read the first error.
+
+### 39. Azure Monitor buckets are stamped with their END time; a neighbouring run's tail leaks in
+- A pin check on `rlC_uksouth_r2` "failed" (38-39 calls to unpinned regions) because its counting
+  window began two minutes before the run and caught the tail of the direct run that ended 2.5
+  minutes earlier. Inside the run's own minutes the unpinned regions had exactly zero calls and
+  UK South had exactly the 321 requests sent.
+- A bucket stamped 12:41 covers real time 12:40-12:41, so a run that ended at 12:40:17 still
+  appears in buckets up to 12:41. Start the window at the run's own start (`PAD_BEFORE_S=0`) and
+  keep >= 3 minutes idle before a run you intend to account for.
+- Before trusting a failed check, print the per-minute series; it distinguishes a leak from
+  contamination at a glance.
+
+### 40. Too few pre-allocated VUs can drop an iteration in a constant-arrival-rate run (suspected)
+- 2 of 4 interleaved runs (one request every 0.67 s, 2 pre-allocated VUs) each dropped exactly one
+  iteration and were discarded under the validity rule; the single-region runs (one request every
+  2 s) never did. Suspected cause: a slow response needs a third VU, which k6 must initialise
+  mid-run. Not tested. Pre-allocate enough VUs for the worst plausible in-flight count, and expect
+  to re-run a fraction of runs.
+
 ---
 
 ## F. Interpretation traps

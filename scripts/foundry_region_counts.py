@@ -3,7 +3,8 @@
 
 Azure Monitor 1-minute buckets lag request time by up to ~1 minute, so a tight window loses
 tail traffic. Window = [mtime-300s-120s, mtime+180s] of experiment/results/<run_id>.json, which is
-only valid when the run was isolated by >=3 minutes idle on both sides (p5r_* runs).
+only valid when the run was isolated by >=3 minutes idle on both sides. Set RUN_SECONDS for runs
+longer than 300 s.
 Usage: python3 -I scripts/foundry_region_counts.py RUN_ID [RUN_ID ...]
 """
 import json, os, subprocess, sys
@@ -20,6 +21,10 @@ def _sub():
     raise SystemExit("subscription_id not found in infra/terraform.tfvars")
 
 SUB = _sub()  # project subscription, not the CLI default
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "300"))  # planned k6 duration of the run
+# Azure Monitor stamps a bucket with its END time, so a previous run's tail shows up to ~1.5 min after it
+# ended. PAD_BEFORE_S=0 starts the window at this run's own start (use when the run before is close).
+PAD_BEFORE_S = int(os.environ.get("PAD_BEFORE_S", "120"))
 
 def az(*args):
     out = subprocess.run(["az", *args, "--subscription", SUB], capture_output=True, text=True, check=True).stdout
@@ -30,7 +35,7 @@ ACCOUNTS = {a["name"].split("-")[1]: a["id"]
 
 def counts(run_id):
     end = datetime.fromtimestamp(os.path.getmtime(os.path.join(RES, run_id + ".json")), timezone.utc)
-    start = (end - timedelta(seconds=420)).replace(second=0, microsecond=0)
+    start = (end - timedelta(seconds=RUN_SECONDS + PAD_BEFORE_S)).replace(second=0, microsecond=0)
     res = {}
     for region, rid in ACCOUNTS.items():
         d = az("monitor", "metrics", "list", "--resource", rid, "--metric", "ModelRequests",

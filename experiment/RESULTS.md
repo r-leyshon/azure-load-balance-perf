@@ -922,3 +922,215 @@ behaviour measured with the broken policy and should be read as "no retry plus w
 circuit breaker did". Phase 5 above replaces them. The quota question (TK11) is resolved: each
 deployment has a request limit of 60 per 60 s alongside 60 000 TPM, about 1 RPM per 1K TPM; the
 measured ~72 RPM ceiling sits ~20% above that and is not fully explained.
+
+---
+
+## Phase 6/7: per-region latency (`rl*` runs)
+
+*Status: complete (runs 2026-11-09, 10:27-15:07 UTC). Rules below were fixed before any run.* This is a measurement experiment, not a resilience
+one. Success rate, quota and failover are out of scope. Infra was rebuilt for it (new Foundry
+accounts and APIM, 60 000 TPM per region, gpt-4.1-mini).
+
+### Questions
+1. How do UK South, West Europe and Sweden Central compare on latency when called directly, with
+   quota to spare, one attempt per request, no gateway?
+2. How much does the APIM hop add per region, with the gateway pinned to one region at a time?
+3. (Secondary) Is any difference stable across times of day and repeats?
+
+### Design (fixed before any run)
+
+| item | value |
+|---|---|
+| Request | `"Reply with exactly one word: Hello."`, `max_tokens` 5, deployment `chat`, api-version 2024-02-01; body validated (`choices[]`) |
+| Rate | **0.5 req/s per region** (30 RPM, half the 60 RPM request limit; the proposed 1 req/s per region would sit exactly at that limit). Interleaved runs send 1.5 req/s total, round-robin |
+| Attempts | one per request; no retry, failover, memory or cool-down |
+| Run length | 640 s = 320 requests per region; the first 20 per region are warm-up, reported separately and never mixed in, leaving ~300 measured per region per run |
+| Connections | reuse on (k6 default), 2 pre-allocated VUs so cold connections fall inside warm-up; each run reports the share of measured samples that opened a new connection |
+| Metric | `http_req_duration` of valid 200 responses only, per region (k6 Trends `latency_<region>`); also reused-connection-only and warm-up Trends |
+| A | direct, interleaved across the 3 regions, 3 repeats spread over the day |
+| B | direct, one region per run (cross-check), 1 repeat per region |
+| C | via APIM pinned to one region (pool pin, **no circuit breaker, no retry**), 3 repeats per region, config confirmed per run from Azure Monitor `ModelRequests` |
+| D | second vantage point: **skipped** (limit: all measurements come from one laptop in the UK) |
+| Machine | `caffeinate` held for every batch |
+
+### Validity rule (fixed before any run)
+
+A run is **discarded and re-run** if any of: wall time exceeds the planned 640 s by more than
+30 s (laptop sleep); any dropped iterations; any non-200, 429, 5xx or invalid body in any request
+(warm-up included); fewer than 295 measured samples for a region in the run; for condition C,
+Azure Monitor shows any Foundry call to an unpinned region, or fewer than 98% of requests
+reaching the pinned region. Discarded runs are listed with the reason.
+
+### Decision rules (fixed before any run)
+
+- **R1, a region is slower** than another only if, in condition A, its median is **> 20 ms
+  higher in every valid repeat** (>= 3 repeats). Otherwise: "no consistent difference".
+- **R2, confirmation:** the ordering must also hold in condition B to be called confirmed;
+  disagreement is reported as an observation.
+- **R3, gateway overhead** (per region) = median over valid C runs minus median over valid A
+  runs (and separately B). It is called real only if it exceeds **20 ms** and exceeds the
+  run-to-run range of run medians in both conditions compared. Otherwise it is noise.
+- **R4, tail pattern:** if C's p95 exceeds A's or B's p95 by more than **100 ms** in any region,
+  report it as the earlier "slowest 1 in 20 via the gateway is 100-400 ms slower" pattern and
+  quantify p95 and p99 differences.
+- **R5, noise:** run-to-run variation is the range of run medians per condition; differences
+  smaller than it are described as noise.
+
+Anything unexpected (one region far slower, overhead that differs by region) is reported as an
+observation without an invented explanation.
+
+### Tooling
+
+`experiment/region_latency_test.js` (new; old scripts untouched), `scripts/run_region_latency.sh`
+(driver), `scripts/region_latency_tables.py` (tables, validity, rules), `scripts/region_pin_check.py`
+(Azure Monitor pin check). Raw k6 JSON and `.meta.json` per run are in `experiment/results/`
+(git-ignored).
+
+### Summary (plain English)
+
+UK South is fastest: median about 300 ms, tight (p95 about 430 ms), and stable across three runs
+through the day. Sweden Central is next, about 65 ms slower (median about 365 ms). West Europe is
+slowest (median about 480 ms) and the least stable: its run medians were 764, 450 and 481 ms and its
+p95 is about 1 s. That order held in every interleaved repeat and in the single-region cross-check.
+Through APIM the median is about the same as direct for UK South and West Europe (within noise) and
+about +30 ms for Sweden Central. The real cost is the tail: p95 is 250-360 ms higher through the
+gateway in all three regions and p99 280-560 ms higher, matching the earlier "slowest 1 in 20" pattern.
+Confidence: good on the ordering (UK South < Sweden Central < West Europe) and on the tail effect;
+moderate on how much slower West Europe is (large run-to-run spread); low on anything beyond one
+laptop in the UK on one day, because the vantage point was not varied (D skipped) and the
+cross-check has one run per region.
+
+### Results
+
+All latencies are `http_req_duration` in ms (excludes connection set-up) of valid 200 responses
+after the 20-request warm-up. Every valid run had zero non-200 responses, zero 429s and zero 5xx.
+Connection reuse was on; **0.0% of measured samples opened a new connection** (cold connections
+fell inside warm-up). Warm-up medians were within about 40 ms of measured medians in every cell
+except B West Europe (warm-up 759 ms vs 575 ms measured), consistent with that region's variability.
+
+**Per condition and region** (valid runs only; median over runs, with [min-max across runs]):
+
+| cond | region | valid runs | median | p95 | p99 | new-connection share of samples | warm-up median |
+|---|---|---|---|---|---|---|---|
+| A | uksouth | 3 | 297 [296-306] | 434 [428-442] | 544 [538-547] | 0.0% | 293 |
+| A | westeurope | 3 | 481 [450-764] | 982 [816-1212] | 1504 [1410-1723] | 0.0% | 447 |
+| A | swedencentral | 3 | 365 [361-372] | 675 [656-749] | 833 [810-890] | 0.0% | 370 |
+| B | uksouth | 1 | 284 [284-284] | 385 [385-385] | 502 [502-502] | 0.0% | 281 |
+| B | westeurope | 1 | 575 [575-575] | 1000 [1000-1000] | 1632 [1632-1632] | 0.0% | 759 |
+| B | swedencentral | 1 | 364 [364-364] | 749 [749-749] | 1009 [1009-1009] | 0.0% | 371 |
+| C | uksouth | 3 | 299 [297-310] | 798 [729-874] | 1103 [1055-1113] | 0.0% | 297 |
+| C | westeurope | 3 | 473 [459-517] | 1233 [1063-1286] | 1783 [1317-1805] | 0.0% | 466 |
+| C | swedencentral | 3 | 396 [383-402] | 929 [806-973] | 1332 [1263-1617] | 0.0% | 390 |
+
+A = direct, interleaved (3 repeats); B = direct, one region per run (1 run per region, so no
+run-to-run spread is available); C = APIM pinned to one region (3 repeats per region), config
+confirmed per run from Azure Monitor (every C run: all Foundry calls reached only the pinned region).
+
+**Gateway overhead per region** (C minus direct, difference of run medians):
+
+| region | vs | median | p95 | p99 | run-to-run range of medians (C / direct) |
+|---|---|---|---|---|---|
+| uksouth | A (interleaved) | +2 | +364 | +559 | 13 / 10 |
+| uksouth | B (single) | +15 | +413 | +601 | 13 / 0 |
+| westeurope | A (interleaved) | -7 | +251 | +279 | 58 / 315 |
+| westeurope | B (single) | -102 | +233 | +152 | 58 / 0 |
+| swedencentral | A (interleaved) | +31 | +254 | +499 | 18 / 11 |
+| swedencentral | B (single) | +32 | +180 | +323 | 18 / 0 |
+
+**Runs table** (UTC start times show the time-of-day spread; ~300 measured samples per region per run):
+
+| run | cond | UTC start | region | n | median | p95 | p99 | max | non-200 | dropped | wall s | valid |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `rlA_r1` | A | 2026-11-09T10:27:40Z | uksouth | 301 | 297 | 442 | 538 | 750 | 0 | 0 | 640 | yes |
+| `rlA_r1` | A | 2026-11-09T10:27:40Z | westeurope | 300 | 764 | 1212 | 1723 | 1951 | 0 | 0 | 640 | yes |
+| `rlA_r1` | A | 2026-11-09T10:27:40Z | swedencentral | 300 | 372 | 749 | 890 | 971 | 0 | 0 | 640 | yes |
+| `rlA_r2` | A | 2026-11-09T12:17:55Z | uksouth | 300 | 287 | 407 | 474 | 583 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r2` | A | 2026-11-09T12:17:55Z | westeurope | 300 | 442 | 941 | 1249 | 2829 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r2` | A | 2026-11-09T12:17:55Z | swedencentral | 300 | 386 | 743 | 950 | 2716 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r2_x2` | A | 2026-11-09T12:29:36Z | uksouth | 300 | 306 | 428 | 544 | 744 | 0 | 0 | 640 | yes |
+| `rlA_r2_x2` | A | 2026-11-09T12:29:36Z | westeurope | 300 | 450 | 816 | 1410 | 3850 | 0 | 0 | 640 | yes |
+| `rlA_r2_x2` | A | 2026-11-09T12:29:36Z | swedencentral | 300 | 365 | 675 | 833 | 1325 | 0 | 0 | 640 | yes |
+| `rlA_r3` | A | 2026-11-09T13:56:25Z | uksouth | 300 | 310 | 614 | 2161 | 3861 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r3` | A | 2026-11-09T13:56:25Z | westeurope | 300 | 527 | 1107 | 1507 | 3801 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r3` | A | 2026-11-09T13:56:25Z | swedencentral | 299 | 373 | 645 | 857 | 4532 | 0 | 1 | 640 | NO: 1 dropped iterations |
+| `rlA_r3_x2` | A | 2026-11-09T14:08:06Z | uksouth | 301 | 296 | 434 | 547 | 1174 | 0 | 0 | 640 | yes |
+| `rlA_r3_x2` | A | 2026-11-09T14:08:06Z | westeurope | 300 | 481 | 982 | 1504 | 2465 | 0 | 0 | 640 | yes |
+| `rlA_r3_x2` | A | 2026-11-09T14:08:06Z | swedencentral | 300 | 361 | 656 | 810 | 1348 | 0 | 0 | 640 | yes |
+| `rlB_swedencentral_r1` | B | 2026-11-09T11:02:44Z | swedencentral | 300 | 364 | 749 | 1009 | 1631 | 0 | 0 | 640 | yes |
+| `rlB_uksouth_r1` | B | 2026-11-09T10:39:22Z | uksouth | 301 | 284 | 385 | 502 | 1179 | 0 | 0 | 640 | yes |
+| `rlB_westeurope_r1` | B | 2026-11-09T10:51:02Z | westeurope | 301 | 575 | 1000 | 1632 | 1745 | 0 | 0 | 640 | yes |
+| `rlC_swedencentral_r1` | C | 2026-11-09T12:02:07Z | swedencentral | 301 | 402 | 929 | 1617 | 7918 | 0 | 0 | 640 | yes |
+| `rlC_swedencentral_r2` | C | 2026-11-09T13:40:36Z | swedencentral | 300 | 383 | 806 | 1263 | 2007 | 0 | 0 | 640 | yes |
+| `rlC_swedencentral_r3` | C | 2026-11-09T14:55:39Z | swedencentral | 301 | 396 | 973 | 1332 | 1785 | 0 | 0 | 641 | yes |
+| `rlC_uksouth_r1` | C | 2026-11-09T11:27:38Z | uksouth | 301 | 297 | 798 | 1103 | 1840 | 0 | 0 | 640 | yes |
+| `rlC_uksouth_r2` | C | 2026-11-09T12:42:42Z | uksouth | 301 | 310 | 874 | 1055 | 1232 | 0 | 0 | 640 | yes |
+| `rlC_uksouth_r3` | C | 2026-11-09T14:21:14Z | uksouth | 301 | 299 | 729 | 1113 | 1349 | 0 | 0 | 640 | yes |
+| `rlC_westeurope_r1` | C | 2026-11-09T11:44:53Z | westeurope | 301 | 459 | 1063 | 1317 | 1596 | 0 | 0 | 641 | yes |
+| `rlC_westeurope_r2` | C | 2026-11-09T13:23:26Z | westeurope | 301 | 473 | 1286 | 1805 | 2488 | 0 | 0 | 640 | yes |
+| `rlC_westeurope_r3` | C | 2026-11-09T14:38:27Z | westeurope | 300 | 517 | 1233 | 1783 | 2489 | 0 | 0 | 640 | yes |
+
+### Rule outcomes (pre-registered rules applied as written)
+
+- **R1, regional ranking (condition A):** the order was **UK South < Sweden Central < West Europe in
+  all three repeats** (10:27, 12:29, 14:08 UTC). Every pairwise gap exceeded 20 ms in every repeat:
+  Sweden Central minus UK South 59-75 ms; West Europe minus UK South 144-468 ms; West Europe minus
+  Sweden Central 84-392 ms. Verdict: West Europe is slower than Sweden Central, which is slower than
+  UK South.
+- **R2, confirmation (condition B):** B gave the same order (UK South 284, Sweden Central 364,
+  West Europe 575 ms), with one run per region. Confirmed, with that limit.
+- **R3, gateway overhead:** formal test against A (B has one run, so no range). **Sweden Central
+  +31 ms is real** (exceeds 20 ms and both run-to-run ranges, 18 and 11 ms); against B it is
+  +32 ms. UK South (+2 vs A, +15 vs B) and West Europe (-7 vs A, -102 vs B) are not distinguishable
+  from noise: UK South is under 20 ms, and West Europe's direct medians alone spread by 315 ms.
+- **R4, tail pattern: present in all three regions.** C's p95 exceeds A's by **+364 ms (UK South),
+  +251 ms (West Europe), +254 ms (Sweden Central)** and B's by +413, +233, +180 ms. At p99 the gap
+  is +559, +279, +499 ms against A. For UK South the median is unchanged (299 vs 297 ms) while p95
+  rises from 434 to 798 ms. This is the earlier "slowest 1 in 20 answers via the gateway is about
+  100-400 ms slower" pattern, seen again.
+- **R5, noise:** run-to-run range of run medians: UK South 10 ms (A) / 13 ms (C), Sweden Central 11 /
+  18 ms, **West Europe 315 / 58 ms**. UK South and Sweden Central differences above are well outside
+  their spread; West Europe's magnitude is not stable (its slowest direct run was the first, 10:27 UTC).
+
+### Observations (no explanation offered)
+
+- West Europe is both the slowest and by far the most variable region directly, and its largest
+  direct median (764 ms) came from the earliest run. Three time points on one day cannot say whether
+  that is time-of-day or chance.
+- The gateway added nothing visible at the median for UK South and West Europe, yet added
+  180-410 ms at p95 everywhere. The median and the tail therefore tell different stories.
+- Because APIM sits in UK South and the load machine is also in the UK, the gateway "overhead" for
+  the other two regions mixes the extra hop with a different network path to the backend; this
+  design cannot separate the two.
+
+### Limits
+
+- **Single vantage point** (a laptop in the UK); condition D was skipped by agreement. The regional
+  ranking could differ from another location.
+- **B has one run per region**, so its agreement with A is supportive, not a replication.
+- Three A repeats within about 4 hours on one day; the secondary question (stability across the
+  day) is only weakly answered.
+- Developer-tier APIM in UK South only.
+- Out of scope and not claimed: resilience, success rate, quota behaviour.
+
+### Discarded runs
+
+| run | reason | outcome |
+|---|---|---|
+| `rlA_r2` | 1 dropped iteration (wall time normal, 640 s) | re-run as `rlA_r2_x2`, valid |
+| `rlA_r3` | 1 dropped iteration | re-run as `rlA_r3_x2`, valid |
+
+Both A discards were a single dropped iteration. The likely cause is that the interleaved runs send a
+request every 0.67 s and the script pre-allocates 2 virtual users, so a slow response can force k6
+to start a third user mid-run (not tested). B and C runs space requests 2 s apart and were unaffected.
+
+One check was a false alarm rather than a discard: the Azure Monitor pin check for `rlC_uksouth_r2`
+first reported traffic to unpinned regions. Its counting window had caught the tail of the previous
+direct run; inside the run's own minutes UK South had exactly 321 calls and the others zero. The run
+was confirmed with the corrected window (and set 1 re-verified the same way). See FOOTGUNS.md #39.
+
+### Infrastructure restored
+
+Pool pinning used weights 100/0/0, 0/100/0 and 0/0/100 (accepted by APIM and confirmed by Azure
+Monitor), with no circuit breaker and no retry. Afterwards the default configuration was reapplied
+and read back from ARM: weights 33/33/34, priorities 1/1/1, no circuit breaker on any backend, no
+retry element in the policy.
